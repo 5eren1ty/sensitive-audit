@@ -20,6 +20,8 @@ FOLLOW_LINKS_METRICS="$LAB_ROOT/audit/scan-follow-links-metrics.json"
 THREADS_METRICS="$LAB_ROOT/audit/scan-threads-metrics.json"
 SECOND_SCAN_METRICS="$LAB_ROOT/audit/scan-second-metrics.json"
 
+mkdir -p "$LAB_ROOT/audit"
+
 python3 /workspace/scripts/generate-fixture.py \
   --lab-root "$LAB_ROOT" \
   --small-files "${SMALL_FILES:-5000}" \
