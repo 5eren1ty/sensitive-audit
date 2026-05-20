@@ -14,6 +14,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 const SCHEMA_VERSION: i64 = 2;
 const DEFAULT_PARTIAL_BYTES: u64 = 64 * 1024;
 const DEFAULT_COMMIT_EVERY: u64 = 1000;
+const DEFAULT_PROGRESS_EVERY_SECONDS: u64 = 10;
 const READ_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Parser)]
@@ -40,6 +41,8 @@ enum Command {
         min_size_bytes: u64,
         #[arg(long, default_value_t = DEFAULT_COMMIT_EVERY)]
         commit_every: u64,
+        #[arg(long, default_value_t = DEFAULT_PROGRESS_EVERY_SECONDS)]
+        progress_every_seconds: u64,
         #[arg(long = "no-clear-existing", action = ArgAction::SetFalse)]
         clear_existing: bool,
     },
@@ -59,6 +62,8 @@ enum Command {
         min_size_bytes: u64,
         #[arg(long, default_value_t = DEFAULT_COMMIT_EVERY)]
         commit_every: u64,
+        #[arg(long, default_value_t = DEFAULT_PROGRESS_EVERY_SECONDS)]
+        progress_every_seconds: u64,
         #[arg(long, default_value_t = false)]
         follow_links: bool,
     },
@@ -99,6 +104,7 @@ struct IndexMetrics {
     files_skipped_min_size: u64,
     read_errors: u64,
     bytes_hashed: u64,
+    files_per_second: f64,
     elapsed_ms: u128,
 }
 
@@ -116,6 +122,7 @@ struct ScanMetrics {
     matches_found: u64,
     read_errors: u64,
     bytes_hashed: u64,
+    files_per_second: f64,
     elapsed_ms: u128,
 }
 
@@ -163,6 +170,7 @@ fn main() -> Result<()> {
             partial_bytes,
             min_size_bytes,
             commit_every,
+            progress_every_seconds,
             clear_existing,
         } => index_sensitive(
             &normalize_arg_path(&root)?,
@@ -171,6 +179,7 @@ fn main() -> Result<()> {
             partial_bytes,
             min_size_bytes,
             commit_every,
+            progress_every_seconds,
             clear_existing,
         ),
         Command::ScanDest {
@@ -181,6 +190,7 @@ fn main() -> Result<()> {
             use_cache,
             min_size_bytes,
             commit_every,
+            progress_every_seconds,
             follow_links,
         } => {
             let csv = csv.map(|path| normalize_arg_path(&path)).transpose()?;
@@ -192,6 +202,7 @@ fn main() -> Result<()> {
                 use_cache,
                 min_size_bytes,
                 commit_every,
+                progress_every_seconds,
                 follow_links,
             )
         }
@@ -209,6 +220,7 @@ fn index_sensitive(
     partial_bytes: u64,
     min_size_bytes: u64,
     commit_every: u64,
+    progress_every_seconds: u64,
     clear_existing: bool,
 ) -> Result<()> {
     if partial_bytes == 0 {
@@ -230,6 +242,7 @@ fn index_sensitive(
     }
 
     let started = Instant::now();
+    let mut last_progress = started;
     let input = File::open(list).with_context(|| format!("opening {}", list.display()))?;
     let reader = BufReader::new(input);
     let mut tx = conn.transaction()?;
@@ -244,6 +257,16 @@ fn index_sensitive(
         }
 
         metrics.sensitive_paths_seen += 1;
+        if should_report_progress(&mut last_progress, progress_every_seconds) {
+            eprintln!(
+                "index progress: paths_seen={} files_indexed={} files_per_second={:.2} bytes_hashed={} elapsed_s={:.1}",
+                metrics.sensitive_paths_seen,
+                metrics.files_indexed,
+                rate(metrics.sensitive_paths_seen, started),
+                metrics.bytes_hashed,
+                elapsed_seconds(started)
+            );
+        }
         let path = root.join(source_rel);
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
@@ -304,6 +327,7 @@ fn index_sensitive(
 
     tx.commit()?;
     metrics.elapsed_ms = started.elapsed().as_millis();
+    metrics.files_per_second = rate(metrics.sensitive_paths_seen, started);
     println!("{}", serde_json::to_string_pretty(&metrics)?);
     Ok(())
 }
@@ -316,6 +340,7 @@ fn scan_dest(
     use_cache: bool,
     min_size_bytes: u64,
     commit_every: u64,
+    progress_every_seconds: u64,
     follow_links: bool,
 ) -> Result<()> {
     if commit_every == 0 {
@@ -339,6 +364,7 @@ fn scan_dest(
     let root_key = root_key(root);
     let run_id = create_scan_run(&conn, root, report)?;
     let started = Instant::now();
+    let mut last_progress = started;
     let report_file = File::create(report).with_context(|| format!("creating {}", report.display()))?;
     let mut report_writer = BufWriter::new(report_file);
     let mut csv_writer = match csv {
@@ -388,6 +414,17 @@ fn scan_dest(
         let mtime_ns = metadata_mtime_ns(&metadata);
         let dest_rel = normalize_rel(path, root)?;
         metrics.files_seen += 1;
+        if should_report_progress(&mut last_progress, progress_every_seconds) {
+            eprintln!(
+                "scan progress: files_seen={} files_per_second={:.2} matches_found={} cache_hits={} bytes_hashed={} elapsed_s={:.1}",
+                metrics.files_seen,
+                rate(metrics.files_seen, started),
+                metrics.matches_found,
+                metrics.cache_hits,
+                metrics.bytes_hashed,
+                elapsed_seconds(started)
+            );
+        }
         upsert_dest_metadata(&tx, &root_key, run_id, &dest_rel, size, mtime_ns)?;
         pending_writes += 1;
         metrics.metadata_cached += 1;
@@ -547,6 +584,7 @@ fn scan_dest(
         writer.flush()?;
     }
     metrics.elapsed_ms = started.elapsed().as_millis();
+    metrics.files_per_second = rate(metrics.files_seen, started);
     finish_scan_run(&tx, run_id, &metrics)?;
     tx.commit()?;
 
@@ -1021,6 +1059,32 @@ fn expand_tilde(path: &Path) -> Result<PathBuf> {
         .or_else(|| env::var_os("USERPROFILE"))
         .context("path uses ~ but HOME/USERPROFILE is not set")?;
     Ok(PathBuf::from(home).join(rest))
+}
+
+fn should_report_progress(last_progress: &mut Instant, every_seconds: u64) -> bool {
+    if every_seconds == 0 {
+        return false;
+    }
+    let now = Instant::now();
+    if now.duration_since(*last_progress).as_secs() >= every_seconds {
+        *last_progress = now;
+        true
+    } else {
+        false
+    }
+}
+
+fn rate(count: u64, started: Instant) -> f64 {
+    let elapsed = started.elapsed().as_secs_f64();
+    if elapsed <= 0.0 {
+        0.0
+    } else {
+        count as f64 / elapsed
+    }
+}
+
+fn elapsed_seconds(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64()
 }
 
 fn root_key(root: &Path) -> String {

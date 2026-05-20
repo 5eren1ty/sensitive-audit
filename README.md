@@ -103,6 +103,8 @@ Use `--min-size-bytes` to ignore small sensitive files and small destination fil
 
 By default, `scan-dest` skips symbolic links. Use `--follow-links` only when symlink targets are intentionally in audit scope. A followed symlink can point outside the destination root, which can add NFS overhead and scan content you did not mean to include.
 
+Both `index-sensitive` and `scan-dest` print human progress to stderr every 10 seconds by default. Use `--progress-every-seconds 0` to disable progress output.
+
 Summarize the database:
 
 ```bash
@@ -145,6 +147,7 @@ Metrics are printed to stdout as JSON. Important scan fields:
 - `full_hashed`: extra full-file hash passes after partial-hash filtering
 - `matches_found`: confirmed sensitive content matches
 - `bytes_hashed`: bytes read for hashing in that run
+- `files_per_second`: average files or sensitive path entries processed per second
 
 On a second unchanged scan, `bytes_hashed` can be `0`. That means the scanner still walked the destination and refreshed metadata, but all size-candidate hashes were reused from the SQLite cache because path, size, mtime, root, and `partial_bytes` matched previous cached records.
 
