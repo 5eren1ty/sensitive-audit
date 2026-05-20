@@ -39,12 +39,12 @@ Prebuilt binaries are attached to GitHub Releases:
 
 ```bash
 curl -L -o sensitive-audit.tar.gz \
-  https://github.com/5eren1ty/sensitive-audit/releases/download/v0.1.0/sensitive-audit-v0.1.0-x86_64-rhel8.tar.gz
+  https://github.com/5eren1ty/sensitive-audit/releases/download/v0.2.0/sensitive-audit-v0.2.0-x86_64-rhel8.tar.gz
 tar -xzf sensitive-audit.tar.gz
-sudo install -m 0755 sensitive-audit-v0.1.0-x86_64-rhel8/sensitive-audit /usr/local/bin/sensitive-audit
+sudo install -m 0755 sensitive-audit-v0.2.0-x86_64-rhel8/sensitive-audit /usr/local/bin/sensitive-audit
 ```
 
-Replace `v0.1.0` with the release tag you want to install.
+Replace `v0.2.0` with the release tag you want to install.
 
 Release binaries are built inside a UBI8 container for RHEL8-compatible Linux userspace. You can also build from source:
 
@@ -99,18 +99,29 @@ sensitive-audit scan-dest \
   --min-size-bytes 0
 ```
 
-Use `--min-size-bytes` to ignore small sensitive files and small destination files. For example, `--min-size-bytes 4096` will not index sensitive files below 4 KiB and will skip destination files below 4 KiB while scanning.
+Useful options:
 
-By default, `scan-dest` skips symbolic links. Use `--follow-links` only when symlink targets are intentionally in audit scope. A followed symlink can point outside the destination root, which can add NFS overhead and scan content you did not mean to include.
+- `--min-size-bytes N`: skip smaller sensitive and destination files.
+- `--commit-every N`: commit SQLite state every N writes, default `1000`.
+- `--progress-every-seconds N`: print progress to stderr, default `10`; use `0` to disable.
+- `--threads N`: parallel hash workers for `scan-dest`, default `1`.
+- `--follow-links`: follow symlink targets during `scan-dest`; default is to skip symlinks.
 
-Both `index-sensitive` and `scan-dest` print human progress to stderr every 10 seconds by default. Use `--progress-every-seconds 0` to disable progress output.
-
-`scan-dest` is single-threaded by default. Use `--threads N` to enable parallel hash workers while keeping SQLite and report writes serialized. On NFS, start with `--threads 1`, then measure `2`, `4`, and `8`; too much concurrency can overload the NFS server or metadata path.
+On NFS, start with `--threads 1`, then measure `2`, `4`, and `8`. Too much concurrency can overload the NFS server or metadata path. Use `--follow-links` only when symlink targets are intentionally in scope; targets may point outside the destination root.
 
 Summarize the database:
 
 ```bash
 sensitive-audit db-summary --db /var/tmp/sensitive-audit/audit.db
+```
+
+Include destination-root and manifest comparison stats:
+
+```bash
+sensitive-audit db-summary \
+  --db /var/tmp/sensitive-audit/audit.db \
+  --root /mnt/copied-data \
+  --list sensitive-paths.txt
 ```
 
 Prune destination metadata and hash-cache rows that were not seen in the latest scan of a root:
@@ -122,6 +133,10 @@ sensitive-audit prune-dest \
 ```
 
 `prune-dest` only trusts finished scans. If a scan was interrupted, its partial run is ignored for pruning.
+
+## Interrupted Runs
+
+Interrupted scans keep committed SQLite rows, but the run remains unfinished with `finished_at: null`. A rerun starts a new scan and walks the destination tree again. Unchanged cached candidates from the interrupted run may avoid rehashing, but this is not a true resume.
 
 ## Outputs
 
@@ -152,6 +167,8 @@ Metrics are printed to stdout as JSON. Important scan fields:
 - `files_per_second`: average files or sensitive path entries processed per second
 
 On a second unchanged scan, `bytes_hashed` can be `0`. That means the scanner still walked the destination and refreshed metadata, but all size-candidate hashes were reused from the SQLite cache because path, size, mtime, root, and `partial_bytes` matched previous cached records.
+
+`db-summary` reports index size statistics, scan-run counts, recent runs, optional root-specific cache/metadata counts, and optional manifest comparison counts.
 
 ## Validation With Docker
 
@@ -199,8 +216,8 @@ The UBI8 image is useful for userland compatibility checks, but it does not repr
 Create and push a version tag:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 GitHub Actions will build the RHEL8-compatible binary in UBI8 and attach a `.tar.gz` plus `.sha256` checksum to the GitHub Release.
