@@ -19,6 +19,11 @@ MIN_SIZE_METRICS="$LAB_ROOT/audit/scan-min-size-metrics.json"
 FOLLOW_LINKS_METRICS="$LAB_ROOT/audit/scan-follow-links-metrics.json"
 THREADS_METRICS="$LAB_ROOT/audit/scan-threads-metrics.json"
 SECOND_SCAN_METRICS="$LAB_ROOT/audit/scan-second-metrics.json"
+INDEX_PROGRESS_LOG="$LAB_ROOT/audit/index-progress.stderr"
+SCAN_PROGRESS_LOG="$LAB_ROOT/audit/scan-progress.stderr"
+SUMMARY="$LAB_ROOT/audit/db-summary.json"
+SUMMARY_ROOT="$LAB_ROOT/audit/db-summary-root.json"
+SUMMARY_LIST="$LAB_ROOT/audit/db-summary-list.json"
 
 mkdir -p "$LAB_ROOT/audit"
 
@@ -36,7 +41,11 @@ cargo run --manifest-path /workspace/Cargo.toml -- index-sensitive \
   --root "$LAB_ROOT/source" \
   --list "$LAB_ROOT/manifests/sensitive-paths.txt" \
   --db "$DB" \
-  > "$INDEX_METRICS"
+  --progress-every-files 1 \
+  > "$INDEX_METRICS" \
+  2> "$INDEX_PROGRESS_LOG"
+
+grep -q "index progress:" "$INDEX_PROGRESS_LOG"
 
 python3 /workspace/scripts/validate-metrics.py \
   --metrics "$INDEX_METRICS" \
@@ -49,13 +58,17 @@ cargo run --manifest-path /workspace/Cargo.toml -- scan-dest \
   --db "$DB" \
   --report "$REPORT" \
   --csv "$CSV" \
-  > "$SCAN_METRICS"
+  --progress-every-files 1000 \
+  > "$SCAN_METRICS" \
+  2> "$SCAN_PROGRESS_LOG"
 scan_status=$?
 set -e
 if [[ "$scan_status" != "2" ]]; then
   echo "expected scan-dest to exit 2 when fixture leaks are found, got $scan_status" >&2
   exit 1
 fi
+
+grep -q "scan progress:" "$SCAN_PROGRESS_LOG"
 
 python3 /workspace/scripts/validate-metrics.py \
   --metrics "$SCAN_METRICS" \
@@ -168,6 +181,28 @@ python3 /workspace/scripts/validate-metrics.py \
   --require-field files_per_second \
   --require-field cache_hits
 
-cargo run --manifest-path /workspace/Cargo.toml -- db-summary --db "$DB"
+cargo run --manifest-path /workspace/Cargo.toml -- db-summary --db "$DB" > "$SUMMARY"
+cargo run --manifest-path /workspace/Cargo.toml -- db-summary --db "$DB" --root "$LAB_ROOT/dest" > "$SUMMARY_ROOT"
+cargo run --manifest-path /workspace/Cargo.toml -- db-summary --db "$DB" --list "$LAB_ROOT/manifests/sensitive-paths.txt" > "$SUMMARY_LIST"
+
+python3 /workspace/scripts/validate-summary.py \
+  --summary "$SUMMARY" \
+  --require-field index.sensitive_files \
+  --require-field index.distinct_sizes \
+  --require-field scan_runs.total \
+  --require-field scan_runs.latest_finished
+
+python3 /workspace/scripts/validate-summary.py \
+  --summary "$SUMMARY_ROOT" \
+  --require-field destination.root \
+  --require-field destination.cache_rows \
+  --require-field destination.cache_full_hash_rows \
+  --require-field destination.latest_finished
+
+python3 /workspace/scripts/validate-summary.py \
+  --summary "$SUMMARY_LIST" \
+  --require-field manifest.listed_paths \
+  --require-field manifest.already_indexed \
+  --require-field manifest.missing_from_index
 
 echo "fixture test passed"

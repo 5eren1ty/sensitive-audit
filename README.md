@@ -104,6 +104,7 @@ Useful options:
 - `--min-size-bytes N`: skip smaller sensitive and destination files.
 - `--commit-every N`: commit SQLite state every N writes, default `1000`.
 - `--progress-every-seconds N`: print progress to stderr, default `10`; use `0` to disable.
+- `--progress-every-files N`: also print progress every N files, default off.
 - `--threads N`: parallel hash workers for `scan-dest`, default `1`.
 - `--follow-links`: follow symlink targets during `scan-dest`; default is to skip symlinks.
 

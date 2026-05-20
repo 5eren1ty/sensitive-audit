@@ -45,6 +45,8 @@ enum Command {
         commit_every: u64,
         #[arg(long, default_value_t = DEFAULT_PROGRESS_EVERY_SECONDS)]
         progress_every_seconds: u64,
+        #[arg(long, default_value_t = 0)]
+        progress_every_files: u64,
         #[arg(long = "no-clear-existing", action = ArgAction::SetFalse)]
         clear_existing: bool,
     },
@@ -66,6 +68,8 @@ enum Command {
         commit_every: u64,
         #[arg(long, default_value_t = DEFAULT_PROGRESS_EVERY_SECONDS)]
         progress_every_seconds: u64,
+        #[arg(long, default_value_t = 0)]
+        progress_every_files: u64,
         #[arg(long, default_value_t = 1)]
         threads: usize,
         #[arg(long, default_value_t = false)]
@@ -202,6 +206,7 @@ fn main() -> Result<()> {
             min_size_bytes,
             commit_every,
             progress_every_seconds,
+            progress_every_files,
             clear_existing,
         } => index_sensitive(
             &normalize_arg_path(&root)?,
@@ -211,6 +216,7 @@ fn main() -> Result<()> {
             min_size_bytes,
             commit_every,
             progress_every_seconds,
+            progress_every_files,
             clear_existing,
         ),
         Command::ScanDest {
@@ -222,6 +228,7 @@ fn main() -> Result<()> {
             min_size_bytes,
             commit_every,
             progress_every_seconds,
+            progress_every_files,
             threads,
             follow_links,
         } => {
@@ -235,6 +242,7 @@ fn main() -> Result<()> {
                 min_size_bytes,
                 commit_every,
                 progress_every_seconds,
+                progress_every_files,
                 threads,
                 follow_links,
             )
@@ -258,6 +266,7 @@ fn index_sensitive(
     min_size_bytes: u64,
     commit_every: u64,
     progress_every_seconds: u64,
+    progress_every_files: u64,
     clear_existing: bool,
 ) -> Result<()> {
     if partial_bytes == 0 {
@@ -294,7 +303,12 @@ fn index_sensitive(
         }
 
         metrics.sensitive_paths_seen += 1;
-        if should_report_progress(&mut last_progress, progress_every_seconds) {
+        if should_report_progress(
+            &mut last_progress,
+            progress_every_seconds,
+            progress_every_files,
+            metrics.sensitive_paths_seen,
+        ) {
             eprintln!(
                 "index progress: paths_seen={} files_indexed={} files_per_second={:.2} bytes_hashed={} elapsed_s={:.1}",
                 metrics.sensitive_paths_seen,
@@ -378,6 +392,7 @@ fn scan_dest(
     min_size_bytes: u64,
     commit_every: u64,
     progress_every_seconds: u64,
+    progress_every_files: u64,
     threads: usize,
     follow_links: bool,
 ) -> Result<()> {
@@ -461,7 +476,12 @@ fn scan_dest(
         let mtime_ns = metadata_mtime_ns(&metadata);
         let dest_rel = normalize_rel(path, root)?;
         metrics.files_seen += 1;
-        if should_report_progress(&mut last_progress, progress_every_seconds) {
+        if should_report_progress(
+            &mut last_progress,
+            progress_every_seconds,
+            progress_every_files,
+            metrics.files_seen,
+        ) {
             eprintln!(
                 "scan progress: files_seen={} files_per_second={:.2} matches_found={} cache_hits={} bytes_hashed={} elapsed_s={:.1}",
                 metrics.files_seen,
@@ -1535,7 +1555,15 @@ fn expand_tilde(path: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(rest))
 }
 
-fn should_report_progress(last_progress: &mut Instant, every_seconds: u64) -> bool {
+fn should_report_progress(
+    last_progress: &mut Instant,
+    every_seconds: u64,
+    every_files: u64,
+    files_seen: u64,
+) -> bool {
+    if every_files > 0 && files_seen > 0 && files_seen % every_files == 0 {
+        return true;
+    }
     if every_seconds == 0 {
         return false;
     }
