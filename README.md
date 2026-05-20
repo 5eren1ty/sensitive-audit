@@ -38,12 +38,12 @@ Prebuilt binaries are attached to GitHub Releases:
 
 ```bash
 curl -L -o sensitive-audit.tar.gz \
-  https://github.com/5eren1ty/sensitive-audit/releases/latest/download/sensitive-audit-<version>-x86_64-rhel8.tar.gz
+  https://github.com/5eren1ty/sensitive-audit/releases/download/v0.1.0/sensitive-audit-v0.1.0-x86_64-rhel8.tar.gz
 tar -xzf sensitive-audit.tar.gz
-sudo install -m 0755 sensitive-audit-<version>-x86_64-rhel8/sensitive-audit /usr/local/bin/sensitive-audit
+sudo install -m 0755 sensitive-audit-v0.1.0-x86_64-rhel8/sensitive-audit /usr/local/bin/sensitive-audit
 ```
 
-Replace `<version>` with the release tag, for example `v0.1.0`.
+Replace `v0.1.0` with the release tag you want to install.
 
 Release binaries are built inside a UBI8 container for RHEL8-compatible Linux userspace. You can also build from source:
 
