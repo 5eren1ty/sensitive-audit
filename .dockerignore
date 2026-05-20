@@ -1,0 +1,7 @@
+lab/
+target/
+.git/
+*.db
+*.sqlite
+*.jsonl
+*.csv

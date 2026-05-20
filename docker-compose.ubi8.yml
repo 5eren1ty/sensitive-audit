@@ -1,0 +1,7 @@
+services:
+  audit-lab:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ubi8
+    image: sensitive-copy-audit-lab:ubi8
+

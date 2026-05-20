@@ -1,0 +1,17 @@
+[package]
+name = "sensitive-audit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Audit destination trees for sensitive source content, even when files were renamed."
+repository = "https://github.com/OWNER/sensitive-audit"
+
+[dependencies]
+anyhow = "1"
+blake3 = { version = "1", features = ["rayon"] }
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"
+rayon = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

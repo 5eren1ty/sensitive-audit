@@ -1,0 +1,9 @@
+lab/
+target/
+*.db
+*.sqlite
+*.jsonl
+*.csv
+*.db-shm
+*.db-wal
+internal-notes/

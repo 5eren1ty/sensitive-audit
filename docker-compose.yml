@@ -1,0 +1,14 @@
+services:
+  audit-lab:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: sensitive-copy-audit-lab:latest
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - ./lab:/lab
+    environment:
+      LAB_ROOT: /lab
+    tty: true
+    stdin_open: true

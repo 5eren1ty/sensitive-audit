@@ -1,0 +1,9 @@
+services:
+  audit-lab:
+    volumes:
+      - .:/workspace
+      - audit_lab_data:/lab
+
+volumes:
+  audit_lab_data:
+

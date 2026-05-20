@@ -1,0 +1,16 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-fixture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --locked
+      - run: cargo build --locked --release
+      - run: docker compose build
+      - run: docker compose run --rm audit-lab bash /workspace/scripts/run-fixture-test.sh

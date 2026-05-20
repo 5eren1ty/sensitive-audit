@@ -1,0 +1,21 @@
+FROM registry.access.redhat.com/ubi8/ubi:latest
+
+RUN dnf install -y \
+        bash \
+        ca-certificates \
+        coreutils \
+        findutils \
+        gcc \
+        jq \
+        python3 \
+        rsync \
+        sqlite \
+        strace \
+        time \
+        tree \
+    && dnf clean all
+
+WORKDIR /workspace
+
+CMD ["/bin/bash"]
+
