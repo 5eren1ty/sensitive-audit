@@ -8,9 +8,11 @@ from pathlib import Path
 def parse_args():
     parser = argparse.ArgumentParser(description="Compare scanner JSONL output to fixture ground truth.")
     parser.add_argument("--expected", required=True, help="expected-leaks.tsv")
+    parser.add_argument("--extra-expected", action="append", default=[], help="additional expected TSV")
     parser.add_argument("--report", required=True, help="scanner JSONL report")
     parser.add_argument("--source-root", required=True, help="source root used for indexing")
     parser.add_argument("--dest-root", required=True, help="destination root used for scanning")
+    parser.add_argument("--min-size-bytes", type=int, default=0)
     return parser.parse_args()
 
 
@@ -22,13 +24,17 @@ def main():
     dest_root = Path(args.dest_root).resolve()
 
     expected = set()
-    with expected_path.open("r", encoding="utf-8", newline="") as fh:
-        reader = csv.DictReader(fh, delimiter="\t")
-        for row in reader:
-            expected.add((
-                str(source_root / row["source_rel"]),
-                str(dest_root / row["dest_rel"]),
-            ))
+    for path in [expected_path, *[Path(item) for item in args.extra_expected]]:
+        with path.open("r", encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh, delimiter="\t")
+            for row in reader:
+                source = source_root / row["source_rel"]
+                if source.stat().st_size < args.min_size_bytes:
+                    continue
+                expected.add((
+                    str(source),
+                    str(dest_root / row["dest_rel"]),
+                ))
 
     actual = set()
     rows = 0

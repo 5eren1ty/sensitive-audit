@@ -84,7 +84,8 @@ Index sensitive source files:
 sensitive-audit index-sensitive \
   --root /mnt/source \
   --list sensitive-paths.txt \
-  --db /var/tmp/sensitive-audit/audit.db
+  --db /var/tmp/sensitive-audit/audit.db \
+  --min-size-bytes 0
 ```
 
 Scan the destination:
@@ -94,8 +95,13 @@ sensitive-audit scan-dest \
   --root /mnt/copied-data \
   --db /var/tmp/sensitive-audit/audit.db \
   --report /var/tmp/sensitive-audit/matches.jsonl \
-  --csv /var/tmp/sensitive-audit/matches.csv
+  --csv /var/tmp/sensitive-audit/matches.csv \
+  --min-size-bytes 0
 ```
+
+Use `--min-size-bytes` to ignore small sensitive files and small destination files. For example, `--min-size-bytes 4096` will not index sensitive files below 4 KiB and will skip destination files below 4 KiB while scanning.
+
+By default, `scan-dest` skips symbolic links. Use `--follow-links` only when symlink targets are intentionally in audit scope. A followed symlink can point outside the destination root, which can add NFS overhead and scan content you did not mean to include.
 
 Summarize the database:
 
@@ -131,6 +137,7 @@ Metrics are printed to stdout as JSON. Important scan fields:
 
 - `files_seen`: destination files visited
 - `metadata_cached`: destination file metadata rows persisted
+- `files_skipped_min_size`: files rejected by `--min-size-bytes`
 - `files_skipped_size`: files rejected by size
 - `size_candidates`: files whose size matched at least one sensitive file
 - `partial_hashed`: files read for partial-hash filtering

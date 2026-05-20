@@ -36,6 +36,8 @@ enum Command {
         db: PathBuf,
         #[arg(long, default_value_t = DEFAULT_PARTIAL_BYTES)]
         partial_bytes: u64,
+        #[arg(long, default_value_t = 0)]
+        min_size_bytes: u64,
         #[arg(long, default_value_t = DEFAULT_COMMIT_EVERY)]
         commit_every: u64,
         #[arg(long = "no-clear-existing", action = ArgAction::SetFalse)]
@@ -53,6 +55,8 @@ enum Command {
         csv: Option<PathBuf>,
         #[arg(long = "no-cache", action = ArgAction::SetFalse)]
         use_cache: bool,
+        #[arg(long, default_value_t = 0)]
+        min_size_bytes: u64,
         #[arg(long, default_value_t = DEFAULT_COMMIT_EVERY)]
         commit_every: u64,
         #[arg(long, default_value_t = false)]
@@ -92,6 +96,7 @@ struct IndexMetrics {
     files_indexed: u64,
     missing_paths: u64,
     skipped_non_files: u64,
+    files_skipped_min_size: u64,
     read_errors: u64,
     bytes_hashed: u64,
     elapsed_ms: u128,
@@ -101,6 +106,7 @@ struct IndexMetrics {
 struct ScanMetrics {
     files_seen: u64,
     metadata_cached: u64,
+    files_skipped_min_size: u64,
     files_skipped_size: u64,
     size_candidates: u64,
     cache_hits: u64,
@@ -155,6 +161,7 @@ fn main() -> Result<()> {
             list,
             db,
             partial_bytes,
+            min_size_bytes,
             commit_every,
             clear_existing,
         } => index_sensitive(
@@ -162,6 +169,7 @@ fn main() -> Result<()> {
             &normalize_arg_path(&list)?,
             &normalize_arg_path(&db)?,
             partial_bytes,
+            min_size_bytes,
             commit_every,
             clear_existing,
         ),
@@ -171,6 +179,7 @@ fn main() -> Result<()> {
             report,
             csv,
             use_cache,
+            min_size_bytes,
             commit_every,
             follow_links,
         } => {
@@ -181,6 +190,7 @@ fn main() -> Result<()> {
                 &normalize_arg_path(&report)?,
                 csv.as_deref(),
                 use_cache,
+                min_size_bytes,
                 commit_every,
                 follow_links,
             )
@@ -197,6 +207,7 @@ fn index_sensitive(
     list: &Path,
     db: &Path,
     partial_bytes: u64,
+    min_size_bytes: u64,
     commit_every: u64,
     clear_existing: bool,
 ) -> Result<()> {
@@ -238,6 +249,7 @@ fn index_sensitive(
             Ok(metadata) => metadata,
             Err(_) => {
                 metrics.missing_paths += 1;
+                eprintln!("skipping missing or unreadable source path: {}", path.display());
                 continue;
             }
         };
@@ -248,6 +260,10 @@ fn index_sensitive(
         }
 
         let size = metadata.len();
+        if size < min_size_bytes {
+            metrics.files_skipped_min_size += 1;
+            continue;
+        }
         match hash_file(&path, size, partial_bytes, true) {
             Ok(fingerprint) => {
                 let full_hash = fingerprint
@@ -281,6 +297,7 @@ fn index_sensitive(
             }
             Err(_) => {
                 metrics.read_errors += 1;
+                eprintln!("skipping unreadable source file: {}", path.display());
             }
         }
     }
@@ -297,6 +314,7 @@ fn scan_dest(
     report: &Path,
     csv: Option<&Path>,
     use_cache: bool,
+    min_size_bytes: u64,
     commit_every: u64,
     follow_links: bool,
 ) -> Result<()> {
@@ -344,6 +362,7 @@ fn scan_dest(
             Ok(entry) => entry,
             Err(_) => {
                 metrics.read_errors += 1;
+                eprintln!("skipping unreadable directory entry under {}", root.display());
                 continue;
             }
         };
@@ -361,6 +380,7 @@ fn scan_dest(
             Ok(metadata) => metadata,
             Err(_) => {
                 metrics.read_errors += 1;
+                eprintln!("skipping file with unreadable metadata: {}", path.display());
                 continue;
             }
         };
@@ -375,6 +395,11 @@ fn scan_dest(
             tx.commit()?;
             tx = conn.transaction()?;
             pending_writes = 0;
+        }
+
+        if size < min_size_bytes {
+            metrics.files_skipped_min_size += 1;
+            continue;
         }
 
         if !index.sizes.contains(&size) {
@@ -403,6 +428,7 @@ fn scan_dest(
                 Ok(fingerprint) => fingerprint,
                 Err(_) => {
                     metrics.read_errors += 1;
+                    eprintln!("skipping unreadable destination file: {}", path.display());
                     continue;
                 }
             };
@@ -429,6 +455,7 @@ fn scan_dest(
                     Ok(fingerprint) => fingerprint,
                     Err(_) => {
                         metrics.read_errors += 1;
+                        eprintln!("skipping unreadable destination file: {}", path.display());
                         continue;
                     }
                 };
@@ -454,6 +481,7 @@ fn scan_dest(
                 Ok(fingerprint) => fingerprint,
                 Err(_) => {
                     metrics.read_errors += 1;
+                    eprintln!("skipping unreadable destination file: {}", path.display());
                     continue;
                 }
             };

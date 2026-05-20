@@ -77,6 +77,7 @@ def main():
 
     sensitive_paths = []
     expected_leaks = []
+    expected_symlink_leaks = []
     normal_copies = 0
     sensitive_files = 0
 
@@ -155,6 +156,34 @@ def main():
         same_prefix_nonmatch = dest_root / "edge-nonmatches" / "same-prefix-different-tail.bin"
         write_pattern(same_prefix_nonmatch, large_prefix + b"D" * (96 * 1024))
 
+        min_size_root = source_root / "sensitive-min-size"
+        min_size_dest = dest_root / "renamed-min-size"
+        for name, payload in [
+            ("below-threshold.txt", b"small-sensitive-under-thirty-two"),
+            ("at-threshold.txt", b"A" * 32),
+            ("above-threshold.txt", b"B" * 33),
+        ]:
+            source = min_size_root / name
+            write_pattern(source, payload)
+            sensitive_files += 1
+            sensitive_paths.append(rel(source, source_root))
+            dest = min_size_dest / f"copy-{name}"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, dest)
+            expected_leaks.append((rel(source, source_root), rel(dest, dest_root), "edge-min-size"))
+
+        symlink_source = edge_root / "symlink-target-sensitive.bin"
+        write_pattern(symlink_source, b"symlink-sensitive-target" * 8)
+        sensitive_files += 1
+        sensitive_paths.append(rel(symlink_source, source_root))
+        symlink_dest = dest_root / "symlinked" / "sensitive-link.bin"
+        symlink_dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            symlink_dest.symlink_to(symlink_source)
+            expected_symlink_leaks.append((rel(symlink_source, source_root), rel(symlink_dest, dest_root), "edge-symlink-sensitive"))
+        except OSError:
+            pass
+
     if sensitive_paths and not expected_leaks:
         source_rel = sensitive_paths[0]
         source_path = source_root / source_rel
@@ -172,6 +201,12 @@ def main():
         for source_rel, dest_rel, reason in expected_leaks:
             fh.write(f"{source_rel}\t{dest_rel}\t{reason}\n")
 
+    symlink_leaks_manifest = manifest_root / "expected-symlink-leaks.tsv"
+    with symlink_leaks_manifest.open("w", encoding="utf-8") as fh:
+        fh.write("source_rel\tdest_rel\treason\n")
+        for source_rel, dest_rel, reason in expected_symlink_leaks:
+            fh.write(f"{source_rel}\t{dest_rel}\t{reason}\n")
+
     summary = {
         "seed": args.seed,
         "small_files": args.small_files,
@@ -183,6 +218,8 @@ def main():
         "dest_root": str(dest_root),
         "sensitive_manifest": str(sensitive_manifest),
         "expected_leaks_manifest": str(leaks_manifest),
+        "expected_symlink_leaks": len(expected_symlink_leaks),
+        "expected_symlink_leaks_manifest": str(symlink_leaks_manifest),
     }
     (manifest_root / "dataset-summary.json").write_text(
         json.dumps(summary, indent=2) + "\n",

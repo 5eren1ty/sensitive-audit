@@ -7,6 +7,10 @@ REPORT="$LAB_ROOT/audit/matches.jsonl"
 CSV="$LAB_ROOT/audit/matches.csv"
 SECOND_REPORT="$LAB_ROOT/audit/matches-second.jsonl"
 SECOND_CSV="$LAB_ROOT/audit/matches-second.csv"
+MIN_SIZE_REPORT="$LAB_ROOT/audit/matches-min-size.jsonl"
+MIN_SIZE_CSV="$LAB_ROOT/audit/matches-min-size.csv"
+FOLLOW_LINKS_REPORT="$LAB_ROOT/audit/matches-follow-links.jsonl"
+FOLLOW_LINKS_CSV="$LAB_ROOT/audit/matches-follow-links.csv"
 
 python3 /workspace/scripts/generate-fixture.py \
   --lab-root "$LAB_ROOT" \
@@ -39,6 +43,48 @@ fi
 python3 /workspace/scripts/compare-report.py \
   --expected "$LAB_ROOT/manifests/expected-leaks.tsv" \
   --report "$REPORT" \
+  --source-root "$LAB_ROOT/source" \
+  --dest-root "$LAB_ROOT/dest"
+
+set +e
+cargo run --manifest-path /workspace/Cargo.toml -- scan-dest \
+  --root "$LAB_ROOT/dest" \
+  --db "$DB" \
+  --report "$MIN_SIZE_REPORT" \
+  --csv "$MIN_SIZE_CSV" \
+  --min-size-bytes 32
+min_size_status=$?
+set -e
+if [[ "$min_size_status" != "2" ]]; then
+  echo "expected min-size scan-dest to exit 2 when fixture leaks are found, got $min_size_status" >&2
+  exit 1
+fi
+
+python3 /workspace/scripts/compare-report.py \
+  --expected "$LAB_ROOT/manifests/expected-leaks.tsv" \
+  --report "$MIN_SIZE_REPORT" \
+  --source-root "$LAB_ROOT/source" \
+  --dest-root "$LAB_ROOT/dest" \
+  --min-size-bytes 32
+
+set +e
+cargo run --manifest-path /workspace/Cargo.toml -- scan-dest \
+  --root "$LAB_ROOT/dest" \
+  --db "$DB" \
+  --report "$FOLLOW_LINKS_REPORT" \
+  --csv "$FOLLOW_LINKS_CSV" \
+  --follow-links
+follow_links_status=$?
+set -e
+if [[ "$follow_links_status" != "2" ]]; then
+  echo "expected follow-links scan-dest to exit 2 when fixture leaks are found, got $follow_links_status" >&2
+  exit 1
+fi
+
+python3 /workspace/scripts/compare-report.py \
+  --expected "$LAB_ROOT/manifests/expected-leaks.tsv" \
+  --extra-expected "$LAB_ROOT/manifests/expected-symlink-leaks.tsv" \
+  --report "$FOLLOW_LINKS_REPORT" \
   --source-root "$LAB_ROOT/source" \
   --dest-root "$LAB_ROOT/dest"
 
