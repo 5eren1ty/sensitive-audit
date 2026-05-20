@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  rhel8-binary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in UBI8
+        run: |
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            registry.access.redhat.com/ubi8/ubi:latest \
+            bash -lc '
+              set -euo pipefail
+              dnf install -y ca-certificates curl gcc make perl pkgconf tar gzip
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+              source "$HOME/.cargo/env"
+              cargo build --release --locked
+              target/release/sensitive-audit --help >/dev/null
+            '
+
+      - name: Package release asset
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          asset_dir="sensitive-audit-${version}-x86_64-rhel8"
+          mkdir -p "dist/${asset_dir}"
+          cp target/release/sensitive-audit "dist/${asset_dir}/sensitive-audit"
+          cp README.md LICENSE "dist/${asset_dir}/"
+          chmod +x "dist/${asset_dir}/sensitive-audit"
+          tar -C dist -czf "dist/${asset_dir}.tar.gz" "${asset_dir}"
+          cd dist
+          sha256sum "${asset_dir}.tar.gz" > "${asset_dir}.tar.gz.sha256"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/sensitive-audit-${{ github.ref_name }}-x86_64-rhel8.tar.gz
+            dist/sensitive-audit-${{ github.ref_name }}-x86_64-rhel8.tar.gz.sha256

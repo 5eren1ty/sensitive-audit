@@ -34,6 +34,19 @@ For RHEL8/NFS deployments, expect traversal, metadata, and file-open latency to 
 
 ## Build
 
+Prebuilt binaries are attached to GitHub Releases:
+
+```bash
+curl -L -o sensitive-audit.tar.gz \
+  https://github.com/5eren1ty/sensitive-audit/releases/latest/download/sensitive-audit-<version>-x86_64-rhel8.tar.gz
+tar -xzf sensitive-audit.tar.gz
+sudo install -m 0755 sensitive-audit-<version>-x86_64-rhel8/sensitive-audit /usr/local/bin/sensitive-audit
+```
+
+Replace `<version>` with the release tag, for example `v0.1.0`.
+
+Release binaries are built inside a UBI8 container for RHEL8-compatible Linux userspace. You can also build from source:
+
 Install Rust on the target or build host, then:
 
 ```bash
@@ -166,3 +179,13 @@ docker compose -f docker-compose.yml -f docker-compose.ubi8.yml build
 
 The UBI8 image is useful for userland compatibility checks, but it does not reproduce NFS performance unless the scanned directories are actual NFS mounts. For production timing, test on the real RHEL8 host and NFS mounts.
 
+## Maintainer Release Process
+
+Create and push a version tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+GitHub Actions will build the RHEL8-compatible binary in UBI8 and attach a `.tar.gz` plus `.sha256` checksum to the GitHub Release.
