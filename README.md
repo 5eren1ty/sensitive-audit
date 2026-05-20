@@ -105,6 +105,8 @@ By default, `scan-dest` skips symbolic links. Use `--follow-links` only when sym
 
 Both `index-sensitive` and `scan-dest` print human progress to stderr every 10 seconds by default. Use `--progress-every-seconds 0` to disable progress output.
 
+`scan-dest` is single-threaded by default. Use `--threads N` to enable parallel hash workers while keeping SQLite and report writes serialized. On NFS, start with `--threads 1`, then measure `2`, `4`, and `8`; too much concurrency can overload the NFS server or metadata path.
+
 Summarize the database:
 
 ```bash

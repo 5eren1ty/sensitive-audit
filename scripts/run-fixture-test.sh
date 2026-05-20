@@ -11,10 +11,13 @@ MIN_SIZE_REPORT="$LAB_ROOT/audit/matches-min-size.jsonl"
 MIN_SIZE_CSV="$LAB_ROOT/audit/matches-min-size.csv"
 FOLLOW_LINKS_REPORT="$LAB_ROOT/audit/matches-follow-links.jsonl"
 FOLLOW_LINKS_CSV="$LAB_ROOT/audit/matches-follow-links.csv"
+THREADS_REPORT="$LAB_ROOT/audit/matches-threads.jsonl"
+THREADS_CSV="$LAB_ROOT/audit/matches-threads.csv"
 INDEX_METRICS="$LAB_ROOT/audit/index-metrics.json"
 SCAN_METRICS="$LAB_ROOT/audit/scan-metrics.json"
 MIN_SIZE_METRICS="$LAB_ROOT/audit/scan-min-size-metrics.json"
 FOLLOW_LINKS_METRICS="$LAB_ROOT/audit/scan-follow-links-metrics.json"
+THREADS_METRICS="$LAB_ROOT/audit/scan-threads-metrics.json"
 SECOND_SCAN_METRICS="$LAB_ROOT/audit/scan-second-metrics.json"
 
 python3 /workspace/scripts/generate-fixture.py \
@@ -115,6 +118,32 @@ python3 /workspace/scripts/compare-report.py \
   --expected "$LAB_ROOT/manifests/expected-leaks.tsv" \
   --extra-expected "$LAB_ROOT/manifests/expected-symlink-leaks.tsv" \
   --report "$FOLLOW_LINKS_REPORT" \
+  --source-root "$LAB_ROOT/source" \
+  --dest-root "$LAB_ROOT/dest"
+
+set +e
+cargo run --manifest-path /workspace/Cargo.toml -- scan-dest \
+  --root "$LAB_ROOT/dest" \
+  --db "$DB" \
+  --report "$THREADS_REPORT" \
+  --csv "$THREADS_CSV" \
+  --threads 4 \
+  > "$THREADS_METRICS"
+threads_status=$?
+set -e
+if [[ "$threads_status" != "2" ]]; then
+  echo "expected threaded scan-dest to exit 2 when fixture leaks are found, got $threads_status" >&2
+  exit 1
+fi
+
+python3 /workspace/scripts/validate-metrics.py \
+  --metrics "$THREADS_METRICS" \
+  --require-field files_per_second \
+  --require-field matches_found
+
+python3 /workspace/scripts/compare-report.py \
+  --expected "$LAB_ROOT/manifests/expected-leaks.tsv" \
+  --report "$THREADS_REPORT" \
   --source-root "$LAB_ROOT/source" \
   --dest-root "$LAB_ROOT/dest"
 

@@ -9,6 +9,8 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const SCHEMA_VERSION: i64 = 2;
@@ -64,6 +66,8 @@ enum Command {
         commit_every: u64,
         #[arg(long, default_value_t = DEFAULT_PROGRESS_EVERY_SECONDS)]
         progress_every_seconds: u64,
+        #[arg(long, default_value_t = 1)]
+        threads: usize,
         #[arg(long, default_value_t = false)]
         follow_links: bool,
     },
@@ -153,6 +157,29 @@ struct FileFingerprint {
 }
 
 #[derive(Debug)]
+struct HashJob {
+    path: PathBuf,
+    dest_rel: String,
+    size: u64,
+}
+
+#[derive(Debug)]
+struct HashOutcome {
+    path: PathBuf,
+    dest_rel: String,
+    size: u64,
+    result: std::result::Result<WorkerFingerprint, String>,
+}
+
+#[derive(Debug)]
+struct WorkerFingerprint {
+    fingerprint: FileFingerprint,
+    partial_hashed: u64,
+    full_hashed: u64,
+    bytes_hashed: u64,
+}
+
+#[derive(Debug)]
 struct SensitiveIndex {
     sizes: HashSet<u64>,
     by_partial: HashMap<(u64, String), Vec<CandidateRecord>>,
@@ -191,6 +218,7 @@ fn main() -> Result<()> {
             min_size_bytes,
             commit_every,
             progress_every_seconds,
+            threads,
             follow_links,
         } => {
             let csv = csv.map(|path| normalize_arg_path(&path)).transpose()?;
@@ -203,6 +231,7 @@ fn main() -> Result<()> {
                 min_size_bytes,
                 commit_every,
                 progress_every_seconds,
+                threads,
                 follow_links,
             )
         }
@@ -341,8 +370,12 @@ fn scan_dest(
     min_size_bytes: u64,
     commit_every: u64,
     progress_every_seconds: u64,
+    threads: usize,
     follow_links: bool,
 ) -> Result<()> {
+    if threads == 0 {
+        bail!("--threads must be greater than zero");
+    }
     if commit_every == 0 {
         bail!("--commit-every must be greater than zero");
     }
@@ -356,7 +389,7 @@ fn scan_dest(
 
     let mut conn = open_db(db)?;
     init_schema(&conn)?;
-    let index = load_sensitive_index(&conn)?;
+    let index = Arc::new(load_sensitive_index(&conn)?);
     if index.sizes.is_empty() {
         bail!("database contains no sensitive file index; run index-sensitive first");
     }
@@ -380,6 +413,12 @@ fn scan_dest(
     let mut tx = conn.transaction()?;
     let mut pending_writes = 0_u64;
     let mut metrics = ScanMetrics::default();
+    let worker_pool = if threads > 1 {
+        Some(start_hash_workers(threads, Arc::clone(&index)))
+    } else {
+        None
+    };
+    let mut outstanding_hash_jobs = 0_u64;
     let mut walker = WalkBuilder::new(root);
     walker.hidden(false).git_ignore(false).git_exclude(false).follow_links(follow_links);
 
@@ -461,6 +500,38 @@ fn scan_dest(
                 bytes_read: 0,
             }
         } else {
+            if let Some((job_tx, outcome_rx, _handles)) = &worker_pool {
+                job_tx
+                    .send(HashJob {
+                        path: path.to_path_buf(),
+                        dest_rel,
+                        size,
+                    })
+                    .context("sending hash job to worker")?;
+                outstanding_hash_jobs += 1;
+                while let Ok(outcome) = outcome_rx.try_recv() {
+                    apply_completed_fingerprint(
+                        &tx,
+                        root,
+                        &root_key,
+                        run_id,
+                        &index,
+                        outcome,
+                        &mut report_writer,
+                        &mut csv_writer,
+                        &mut metrics,
+                        &mut pending_writes,
+                    )?;
+                    outstanding_hash_jobs -= 1;
+                    if pending_writes >= commit_every {
+                        tx.commit()?;
+                        tx = conn.transaction()?;
+                        pending_writes = 0;
+                    }
+                }
+                continue;
+            }
+
             let partial = match hash_file(path, size, index.partial_bytes, false) {
                 Ok(fingerprint) => fingerprint,
                 Err(_) => {
@@ -579,6 +650,36 @@ fn scan_dest(
         }
     }
 
+    if let Some((job_tx, outcome_rx, handles)) = worker_pool {
+        drop(job_tx);
+        while outstanding_hash_jobs > 0 {
+            let outcome = outcome_rx
+                .recv()
+                .context("receiving hash worker result")?;
+            apply_completed_fingerprint(
+                &tx,
+                root,
+                &root_key,
+                run_id,
+                &index,
+                outcome,
+                &mut report_writer,
+                &mut csv_writer,
+                &mut metrics,
+                &mut pending_writes,
+            )?;
+            outstanding_hash_jobs -= 1;
+            if pending_writes >= commit_every {
+                tx.commit()?;
+                tx = conn.transaction()?;
+                pending_writes = 0;
+            }
+        }
+        for handle in handles {
+            handle.join().map_err(|_| anyhow::anyhow!("hash worker panicked"))?;
+        }
+    }
+
     report_writer.flush()?;
     if let Some(writer) = csv_writer.as_mut() {
         writer.flush()?;
@@ -664,6 +765,157 @@ fn prune_dest(db: &Path, root: &Path) -> Result<()> {
             "cache_rows_pruned": stale_cache
         }))?
     );
+    Ok(())
+}
+
+fn start_hash_workers(
+    threads: usize,
+    index: Arc<SensitiveIndex>,
+) -> (
+    crossbeam_channel::Sender<HashJob>,
+    crossbeam_channel::Receiver<HashOutcome>,
+    Vec<thread::JoinHandle<()>>,
+) {
+    let capacity = threads.saturating_mul(4).max(1);
+    let (job_tx, job_rx) = crossbeam_channel::bounded::<HashJob>(capacity);
+    let (outcome_tx, outcome_rx) = crossbeam_channel::unbounded::<HashOutcome>();
+    let mut handles = Vec::with_capacity(threads);
+
+    for _ in 0..threads {
+        let job_rx = job_rx.clone();
+        let outcome_tx = outcome_tx.clone();
+        let index = Arc::clone(&index);
+        handles.push(thread::spawn(move || {
+            while let Ok(job) = job_rx.recv() {
+                let result = hash_for_scan_worker(&job, &index).map_err(|err| err.to_string());
+                if outcome_tx
+                    .send(HashOutcome {
+                        path: job.path,
+                        dest_rel: job.dest_rel,
+                        size: job.size,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
+    (job_tx, outcome_rx, handles)
+}
+
+fn hash_for_scan_worker(job: &HashJob, index: &SensitiveIndex) -> Result<WorkerFingerprint> {
+    let partial = hash_file(&job.path, job.size, index.partial_bytes, false)?;
+    let partial_hashed = 1;
+    let mut full_hashed = 0;
+    let mut bytes_hashed = partial.bytes_read;
+    let key = (job.size, partial.partial_hash.clone());
+
+    let fingerprint = if !index.by_partial.contains_key(&key) || partial.full_hash.is_some() {
+        partial
+    } else {
+        let full = hash_file(&job.path, job.size, index.partial_bytes, true)?;
+        full_hashed = 1;
+        bytes_hashed += full.bytes_read;
+        full
+    };
+
+    Ok(WorkerFingerprint {
+        fingerprint,
+        partial_hashed,
+        full_hashed,
+        bytes_hashed,
+    })
+}
+
+fn apply_completed_fingerprint(
+    tx: &Connection,
+    root: &Path,
+    root_key: &str,
+    run_id: i64,
+    index: &SensitiveIndex,
+    outcome: HashOutcome,
+    report_writer: &mut BufWriter<File>,
+    csv_writer: &mut Option<BufWriter<File>>,
+    metrics: &mut ScanMetrics,
+    pending_writes: &mut u64,
+) -> Result<()> {
+    let worker = match outcome.result {
+        Ok(worker) => worker,
+        Err(err) => {
+            metrics.read_errors += 1;
+            eprintln!(
+                "skipping unreadable destination file: {} ({err})",
+                outcome.path.display()
+            );
+            return Ok(());
+        }
+    };
+
+    metrics.partial_hashed += worker.partial_hashed;
+    metrics.full_hashed += worker.full_hashed;
+    metrics.bytes_hashed += worker.bytes_hashed;
+
+    upsert_cache(
+        tx,
+        root_key,
+        &outcome.dest_rel,
+        index.partial_bytes,
+        &worker.fingerprint,
+    )?;
+    *pending_writes += 1;
+
+    let key = (outcome.size, worker.fingerprint.partial_hash.clone());
+    let Some(candidates) = index.by_partial.get(&key) else {
+        return Ok(());
+    };
+    metrics.partial_candidates += 1;
+
+    let Some(full_hash) = worker.fingerprint.full_hash.as_deref() else {
+        return Ok(());
+    };
+
+    for candidate in candidates {
+        if candidate.full_hash == full_hash {
+            let dest_path = root.join(&outcome.dest_rel).display().to_string();
+            let source_path = index.source_root.join(&candidate.source_rel).display().to_string();
+            let item = MatchReport {
+                dest_path,
+                source_path,
+                size: outcome.size,
+                hash_algorithm: "blake3",
+                full_hash: full_hash.to_string(),
+            };
+            writeln!(report_writer, "{}", serde_json::to_string(&item)?)?;
+            if let Some(writer) = csv_writer.as_mut() {
+                writeln!(
+                    writer,
+                    "{},{},{},blake3,{}",
+                    csv_escape(&item.dest_path),
+                    csv_escape(&item.source_path),
+                    item.size,
+                    item.full_hash
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO scan_matches (run_id, dest_rel, source_rel, size, full_hash, matched_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    run_id,
+                    &outcome.dest_rel,
+                    &candidate.source_rel,
+                    size_to_i64(item.size)?,
+                    &item.full_hash,
+                    now_string()
+                ],
+            )?;
+            *pending_writes += 1;
+            metrics.matches_found += 1;
+        }
+    }
+
     Ok(())
 }
 

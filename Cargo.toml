@@ -10,6 +10,7 @@ repository = "https://github.com/5eren1ty/sensitive-audit"
 anyhow = "1"
 blake3 = { version = "1", features = ["rayon"] }
 clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
 ignore = "0.4"
 rayon = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
