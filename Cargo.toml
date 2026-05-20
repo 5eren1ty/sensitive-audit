@@ -1,6 +1,6 @@
 [package]
 name = "sensitive-audit"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Audit destination trees for sensitive source content, even when files were renamed."
