@@ -38,7 +38,9 @@ fi
 
 python3 /workspace/scripts/compare-report.py \
   --expected "$LAB_ROOT/manifests/expected-leaks.tsv" \
-  --report "$REPORT"
+  --report "$REPORT" \
+  --source-root "$LAB_ROOT/source" \
+  --dest-root "$LAB_ROOT/dest"
 
 set +e
 cargo run --manifest-path /workspace/Cargo.toml -- scan-dest \

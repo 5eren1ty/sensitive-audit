@@ -115,13 +115,13 @@ sensitive-audit prune-dest \
 JSONL report, one object per confirmed match:
 
 ```json
-{"dest_rel":"renamed/file.bin","source_rel":"sensitive/file.bin","size":1234,"hash_algorithm":"blake3","full_hash":"..."}
+{"dest_path":"/mnt/copied-data/renamed/file.bin","source_path":"/mnt/source/sensitive/file.bin","size":1234,"hash_algorithm":"blake3","full_hash":"..."}
 ```
 
 CSV report columns:
 
 ```text
-dest_rel,source_rel,size,hash_algorithm,full_hash
+dest_path,source_path,size,hash_algorithm,full_hash
 ```
 
 Metrics are printed to stdout as JSON. Important scan fields:

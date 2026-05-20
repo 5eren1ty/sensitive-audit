@@ -5,6 +5,7 @@ use ignore::WalkBuilder;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -109,8 +110,8 @@ struct ScanMetrics {
 
 #[derive(Debug, Serialize)]
 struct MatchReport {
-    dest_rel: String,
-    source_rel: String,
+    dest_path: String,
+    source_path: String,
     size: u64,
     hash_algorithm: &'static str,
     full_hash: String,
@@ -138,6 +139,7 @@ struct SensitiveIndex {
     sizes: HashSet<u64>,
     by_partial: HashMap<(u64, String), Vec<CandidateRecord>>,
     partial_bytes: u64,
+    source_root: PathBuf,
 }
 
 fn main() -> Result<()> {
@@ -149,7 +151,13 @@ fn main() -> Result<()> {
             db,
             partial_bytes,
             clear_existing,
-        } => index_sensitive(&root, &list, &db, partial_bytes, clear_existing),
+        } => index_sensitive(
+            &normalize_arg_path(&root)?,
+            &normalize_arg_path(&list)?,
+            &normalize_arg_path(&db)?,
+            partial_bytes,
+            clear_existing,
+        ),
         Command::ScanDest {
             root,
             db,
@@ -157,9 +165,21 @@ fn main() -> Result<()> {
             csv,
             use_cache,
             follow_links,
-        } => scan_dest(&root, &db, &report, csv.as_deref(), use_cache, follow_links),
-        Command::DbSummary { db } => db_summary(&db),
-        Command::PruneDest { db, root } => prune_dest(&db, &root),
+        } => {
+            let csv = csv.map(|path| normalize_arg_path(&path)).transpose()?;
+            scan_dest(
+                &normalize_arg_path(&root)?,
+                &normalize_arg_path(&db)?,
+                &normalize_arg_path(&report)?,
+                csv.as_deref(),
+                use_cache,
+                follow_links,
+            )
+        }
+        Command::DbSummary { db } => db_summary(&normalize_arg_path(&db)?),
+        Command::PruneDest { db, root } => {
+            prune_dest(&normalize_arg_path(&db)?, &normalize_arg_path(&root)?)
+        }
     }
 }
 
@@ -179,6 +199,7 @@ fn index_sensitive(
     let mut conn = open_db(db)?;
     init_schema(&conn)?;
     set_meta(&conn, "partial_bytes", &partial_bytes.to_string())?;
+    set_meta(&conn, "source_root", &root.display().to_string())?;
 
     if clear_existing {
         conn.execute("DELETE FROM sensitive_files", [])?;
@@ -284,7 +305,7 @@ fn scan_dest(
         None => None,
     };
     if let Some(writer) = csv_writer.as_mut() {
-        writeln!(writer, "dest_rel,source_rel,size,hash_algorithm,full_hash")?;
+        writeln!(writer, "dest_path,source_path,size,hash_algorithm,full_hash")?;
     }
 
     let tx = conn.transaction()?;
@@ -408,9 +429,11 @@ fn scan_dest(
 
         for candidate in candidates {
             if candidate.full_hash == full_hash {
+                let dest_path = root.join(&dest_rel).display().to_string();
+                let source_path = index.source_root.join(&candidate.source_rel).display().to_string();
                 let item = MatchReport {
-                    dest_rel: dest_rel.clone(),
-                    source_rel: candidate.source_rel.clone(),
+                    dest_path,
+                    source_path,
                     size,
                     hash_algorithm: "blake3",
                     full_hash: full_hash.to_string(),
@@ -420,8 +443,8 @@ fn scan_dest(
                     writeln!(
                         writer,
                         "{},{},{},blake3,{}",
-                        csv_escape(&item.dest_rel),
-                        csv_escape(&item.source_rel),
+                        csv_escape(&item.dest_path),
+                        csv_escape(&item.source_path),
                         item.size,
                         item.full_hash
                     )?;
@@ -431,10 +454,10 @@ fn scan_dest(
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         run_id,
-                        item.dest_rel,
-                        item.source_rel,
+                        &dest_rel,
+                        &candidate.source_rel,
                         size_to_i64(item.size)?,
-                        item.full_hash,
+                        &item.full_hash,
                         now_string()
                     ],
                 )?;
@@ -472,11 +495,13 @@ fn db_summary(db: &Path) -> Result<()> {
     let scan_runs: i64 =
         conn.query_row("SELECT COUNT(*) FROM scan_runs", [], |row| row.get(0))?;
     let partial_bytes = get_meta(&conn, "partial_bytes")?.unwrap_or_else(|| "unknown".to_string());
+    let source_root = get_meta(&conn, "source_root")?.unwrap_or_else(|| "unknown".to_string());
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "partial_bytes": partial_bytes,
+            "source_root": source_root,
             "sensitive_files": sensitive_count,
             "distinct_sensitive_sizes": distinct_sizes,
             "cached_dest_files": cached_dest,
@@ -673,9 +698,13 @@ fn load_sensitive_index(conn: &Connection) -> Result<SensitiveIndex> {
     let partial_bytes = get_meta(conn, "partial_bytes")?
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(DEFAULT_PARTIAL_BYTES);
+    let source_root = get_meta(conn, "source_root")?
+        .map(PathBuf::from)
+        .context("database is missing source_root metadata; rerun index-sensitive with this version")?;
     let mut stmt = conn.prepare(
         "SELECT source_rel, size, partial_hash, full_hash
-         FROM sensitive_files",
+         FROM sensitive_files
+         ORDER BY size, partial_hash, full_hash, source_rel",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(SensitiveRecord {
@@ -704,6 +733,7 @@ fn load_sensitive_index(conn: &Connection) -> Result<SensitiveIndex> {
         sizes,
         by_partial,
         partial_bytes,
+        source_root,
     })
 }
 
@@ -888,6 +918,33 @@ fn normalize_rel(path: &Path, root: &Path) -> Result<String> {
         .strip_prefix(root)
         .with_context(|| format!("{} is not under {}", path.display(), root.display()))?;
     Ok(rel.to_string_lossy().replace('\\', "/"))
+}
+
+fn normalize_arg_path(path: &Path) -> Result<PathBuf> {
+    let expanded = expand_tilde(path)?;
+    if expanded.is_absolute() {
+        Ok(expanded)
+    } else {
+        Ok(env::current_dir()
+            .context("reading current directory")?
+            .join(expanded))
+    }
+}
+
+fn expand_tilde(path: &Path) -> Result<PathBuf> {
+    let raw = path.to_string_lossy();
+    let Some(rest) = raw
+        .strip_prefix("~/")
+        .or_else(|| raw.strip_prefix("~\\"))
+        .or_else(|| (raw == "~").then_some(""))
+    else {
+        return Ok(path.to_path_buf());
+    };
+
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .context("path uses ~ but HOME/USERPROFILE is not set")?;
+    Ok(PathBuf::from(home).join(rest))
 }
 
 fn root_key(root: &Path) -> String {
