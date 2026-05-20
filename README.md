@@ -211,14 +211,3 @@ docker compose -f docker-compose.yml -f docker-compose.ubi8.yml build
 ```
 
 The UBI8 image is useful for userland compatibility checks, but it does not reproduce NFS performance unless the scanned directories are actual NFS mounts. For production timing, test on the real RHEL8 host and NFS mounts.
-
-## Maintainer Release Process
-
-Create and push a version tag:
-
-```bash
-git tag v0.2.0
-git push origin v0.2.0
-```
-
-GitHub Actions will build the RHEL8-compatible binary in UBI8 and attach a `.tar.gz` plus `.sha256` checksum to the GitHub Release.
