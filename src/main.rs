@@ -75,6 +75,10 @@ enum Command {
     DbSummary {
         #[arg(long)]
         db: PathBuf,
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        list: Option<PathBuf>,
     },
     /// Remove destination metadata/cache rows not seen in the latest scan run.
     PruneDest {
@@ -235,7 +239,11 @@ fn main() -> Result<()> {
                 follow_links,
             )
         }
-        Command::DbSummary { db } => db_summary(&normalize_arg_path(&db)?),
+        Command::DbSummary { db, root, list } => {
+            let root = root.map(|path| normalize_arg_path(&path)).transpose()?;
+            let list = list.map(|path| normalize_arg_path(&path)).transpose()?;
+            db_summary(&normalize_arg_path(&db)?, root.as_deref(), list.as_deref())
+        }
         Command::PruneDest { db, root } => {
             prune_dest(&normalize_arg_path(&db)?, &normalize_arg_path(&root)?)
         }
@@ -696,35 +704,245 @@ fn scan_dest(
     Ok(())
 }
 
-fn db_summary(db: &Path) -> Result<()> {
+fn db_summary(db: &Path, root: Option<&Path>, list: Option<&Path>) -> Result<()> {
     let conn = open_db(db)?;
     init_schema(&conn)?;
-    let sensitive_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM sensitive_files", [], |row| row.get(0))?;
-    let distinct_sizes: i64 =
-        conn.query_row("SELECT COUNT(DISTINCT size) FROM sensitive_files", [], |row| row.get(0))?;
-    let cached_dest: i64 =
-        conn.query_row("SELECT COUNT(*) FROM dest_cache", [], |row| row.get(0))?;
-    let metadata_dest: i64 =
-        conn.query_row("SELECT COUNT(*) FROM dest_files", [], |row| row.get(0))?;
-    let scan_runs: i64 =
-        conn.query_row("SELECT COUNT(*) FROM scan_runs", [], |row| row.get(0))?;
     let partial_bytes = get_meta(&conn, "partial_bytes")?.unwrap_or_else(|| "unknown".to_string());
     let source_root = get_meta(&conn, "source_root")?.unwrap_or_else(|| "unknown".to_string());
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "schema_version": SCHEMA_VERSION,
-            "partial_bytes": partial_bytes,
-            "source_root": source_root,
-            "sensitive_files": sensitive_count,
-            "distinct_sensitive_sizes": distinct_sizes,
-            "cached_dest_files": cached_dest,
-            "dest_metadata_files": metadata_dest,
-            "scan_runs": scan_runs
-        }))?
-    );
+
+    let mut summary = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "partial_bytes": partial_bytes,
+        "source_root": source_root,
+        "index": index_summary(&conn)?,
+        "scan_runs": scan_runs_summary(&conn)?,
+    });
+
+    if let Some(list) = list {
+        summary["manifest"] = manifest_summary(&conn, list)?;
+    }
+    if let Some(root) = root {
+        summary["destination"] = destination_summary(&conn, root)?;
+    }
+
+    println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
+}
+
+fn index_summary(conn: &Connection) -> Result<serde_json::Value> {
+    let files: i64 = conn.query_row("SELECT COUNT(*) FROM sensitive_files", [], |row| row.get(0))?;
+    let distinct_sizes: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT size) FROM sensitive_files",
+        [],
+        |row| row.get(0),
+    )?;
+    let total_bytes: i64 =
+        conn.query_row("SELECT COALESCE(SUM(size), 0) FROM sensitive_files", [], |row| row.get(0))?;
+    let min_size: Option<i64> =
+        conn.query_row("SELECT MIN(size) FROM sensitive_files", [], |row| row.get(0))?;
+    let max_size: Option<i64> =
+        conn.query_row("SELECT MAX(size) FROM sensitive_files", [], |row| row.get(0))?;
+    let average_size: Option<f64> =
+        conn.query_row("SELECT AVG(size) FROM sensitive_files", [], |row| row.get(0))?;
+    let duplicate_full_hash_groups: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM (
+            SELECT full_hash FROM sensitive_files GROUP BY full_hash HAVING COUNT(*) > 1
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    let duplicate_full_hash_files: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(file_count), 0) FROM (
+            SELECT COUNT(*) AS file_count FROM sensitive_files GROUP BY full_hash HAVING COUNT(*) > 1
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+
+    Ok(serde_json::json!({
+        "sensitive_files": files,
+        "distinct_sizes": distinct_sizes,
+        "total_bytes": total_bytes,
+        "min_size": min_size,
+        "max_size": max_size,
+        "average_size": average_size,
+        "duplicate_full_hash_groups": duplicate_full_hash_groups,
+        "duplicate_full_hash_files": duplicate_full_hash_files,
+    }))
+}
+
+fn scan_runs_summary(conn: &Connection) -> Result<serde_json::Value> {
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM scan_runs", [], |row| row.get(0))?;
+    let finished: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM scan_runs WHERE finished_at IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    let unfinished: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM scan_runs WHERE finished_at IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    let latest_finished = latest_run_id(conn, None, true)?
+        .map(|id| run_detail(conn, id))
+        .transpose()?;
+    let latest_unfinished = latest_run_id(conn, None, false)?
+        .map(|id| run_detail(conn, id))
+        .transpose()?;
+    let recent_runs = recent_run_details(conn, 10)?;
+
+    Ok(serde_json::json!({
+        "total": total,
+        "finished": finished,
+        "unfinished": unfinished,
+        "latest_finished": latest_finished,
+        "latest_unfinished": latest_unfinished,
+        "recent": recent_runs,
+    }))
+}
+
+fn destination_summary(conn: &Connection, root: &Path) -> Result<serde_json::Value> {
+    let root = root_key(root);
+    let metadata_rows: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dest_files WHERE root = ?1",
+        params![root],
+        |row| row.get(0),
+    )?;
+    let cache_rows: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dest_cache WHERE root = ?1",
+        params![root],
+        |row| row.get(0),
+    )?;
+    let cache_full_hash_rows: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dest_cache WHERE root = ?1 AND full_hash IS NOT NULL",
+        params![root],
+        |row| row.get(0),
+    )?;
+    let latest_finished = latest_run_id(conn, Some(&root), true)?
+        .map(|id| run_detail(conn, id))
+        .transpose()?;
+    let latest_unfinished = latest_run_id(conn, Some(&root), false)?
+        .map(|id| run_detail(conn, id))
+        .transpose()?;
+
+    Ok(serde_json::json!({
+        "root": root,
+        "metadata_rows": metadata_rows,
+        "cache_rows": cache_rows,
+        "cache_full_hash_rows": cache_full_hash_rows,
+        "latest_finished": latest_finished,
+        "latest_unfinished": latest_unfinished,
+    }))
+}
+
+fn manifest_summary(conn: &Connection, list: &Path) -> Result<serde_json::Value> {
+    let listed = read_sensitive_list(list)?;
+    let indexed = load_indexed_source_paths(conn)?;
+    let listed_count = listed.len();
+    let already_indexed = listed.intersection(&indexed).count();
+    let missing_from_index = listed.difference(&indexed).count();
+    let extra_indexed_not_in_list = indexed.difference(&listed).count();
+
+    Ok(serde_json::json!({
+        "list": list.display().to_string(),
+        "listed_paths": listed_count,
+        "already_indexed": already_indexed,
+        "missing_from_index": missing_from_index,
+        "extra_indexed_not_in_list": extra_indexed_not_in_list,
+    }))
+}
+
+fn read_sensitive_list(list: &Path) -> Result<HashSet<String>> {
+    let input = File::open(list).with_context(|| format!("opening {}", list.display()))?;
+    let reader = BufReader::new(input);
+    let mut paths = HashSet::new();
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("reading {}", list.display()))?;
+        let item = line.trim();
+        if !item.is_empty() && !item.starts_with('#') {
+            paths.insert(item.to_string());
+        }
+    }
+    Ok(paths)
+}
+
+fn load_indexed_source_paths(conn: &Connection) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT source_rel FROM sensitive_files")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut paths = HashSet::new();
+    for row in rows {
+        paths.insert(row?);
+    }
+    Ok(paths)
+}
+
+fn latest_run_id(conn: &Connection, root: Option<&str>, finished: bool) -> Result<Option<i64>> {
+    let finished_clause = if finished {
+        "finished_at IS NOT NULL"
+    } else {
+        "finished_at IS NULL"
+    };
+    match root {
+        Some(root) => conn
+            .query_row(
+                &format!("SELECT MAX(id) FROM scan_runs WHERE root = ?1 AND {finished_clause}"),
+                params![root],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(Into::into),
+        None => conn
+            .query_row(
+                &format!("SELECT MAX(id) FROM scan_runs WHERE {finished_clause}"),
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(Into::into),
+    }
+}
+
+fn recent_run_details(conn: &Connection, limit: i64) -> Result<Vec<serde_json::Value>> {
+    let mut stmt = conn.prepare("SELECT id FROM scan_runs ORDER BY id DESC LIMIT ?1")?;
+    let rows = stmt.query_map(params![limit], |row| row.get::<_, i64>(0))?;
+    let mut runs = Vec::new();
+    for row in rows {
+        runs.push(run_detail(conn, row?)?);
+    }
+    Ok(runs)
+}
+
+fn run_detail(conn: &Connection, run_id: i64) -> Result<serde_json::Value> {
+    let (root, report, started_at, finished_at) = conn.query_row(
+        "SELECT root, report, started_at, finished_at FROM scan_runs WHERE id = ?1",
+        params![run_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        },
+    )?;
+    let matches: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM scan_matches WHERE run_id = ?1",
+        params![run_id],
+        |row| row.get(0),
+    )?;
+    let metadata_rows: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dest_files WHERE root = ?1 AND last_seen_run_id = ?2",
+        params![root, run_id],
+        |row| row.get(0),
+    )?;
+
+    Ok(serde_json::json!({
+        "id": run_id,
+        "root": root,
+        "report": report,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "matches": matches,
+        "metadata_rows": metadata_rows,
+    }))
 }
 
 fn prune_dest(db: &Path, root: &Path) -> Result<()> {
@@ -984,6 +1202,10 @@ fn init_schema(conn: &Connection) -> Result<()> {
             matched_at TEXT NOT NULL,
             FOREIGN KEY(run_id) REFERENCES scan_runs(id)
         );
+        CREATE INDEX IF NOT EXISTS idx_scan_runs_root_finished ON scan_runs(root, finished_at, id);
+        CREATE INDEX IF NOT EXISTS idx_dest_files_root_run ON dest_files(root, last_seen_run_id);
+        CREATE INDEX IF NOT EXISTS idx_scan_matches_run ON scan_matches(run_id);
+        CREATE INDEX IF NOT EXISTS idx_dest_cache_root ON dest_cache(root);
         ",
     )?;
     migrate_cache_tables(conn)?;
