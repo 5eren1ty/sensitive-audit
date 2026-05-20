@@ -29,6 +29,7 @@ This is a practical prototype suitable for validation and controlled operational
 - Pass destination roots consistently; cache scopes use the root path string.
 - Store the SQLite database and reports on local storage when possible, not on the NFS tree being scanned.
 - `scan-dest` exits with code `2` when matches are found. That is intentional for CI and batch jobs.
+- SQLite metadata is committed in batches. The default `--commit-every 1000` limits data loss on interruption without committing every file.
 
 For RHEL8/NFS deployments, expect traversal, metadata, and file-open latency to matter more than raw hash speed. Tune by measuring on the real mounted filesystems.
 
@@ -109,6 +110,8 @@ sensitive-audit prune-dest \
   --db /var/tmp/sensitive-audit/audit.db \
   --root /mnt/copied-data
 ```
+
+`prune-dest` only trusts finished scans. If a scan was interrupted, its partial run is ignored for pruning.
 
 ## Outputs
 

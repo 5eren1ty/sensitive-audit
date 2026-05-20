@@ -13,6 +13,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const SCHEMA_VERSION: i64 = 2;
 const DEFAULT_PARTIAL_BYTES: u64 = 64 * 1024;
+const DEFAULT_COMMIT_EVERY: u64 = 1000;
 const READ_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Parser)]
@@ -35,6 +36,8 @@ enum Command {
         db: PathBuf,
         #[arg(long, default_value_t = DEFAULT_PARTIAL_BYTES)]
         partial_bytes: u64,
+        #[arg(long, default_value_t = DEFAULT_COMMIT_EVERY)]
+        commit_every: u64,
         #[arg(long = "no-clear-existing", action = ArgAction::SetFalse)]
         clear_existing: bool,
     },
@@ -50,6 +53,8 @@ enum Command {
         csv: Option<PathBuf>,
         #[arg(long = "no-cache", action = ArgAction::SetFalse)]
         use_cache: bool,
+        #[arg(long, default_value_t = DEFAULT_COMMIT_EVERY)]
+        commit_every: u64,
         #[arg(long, default_value_t = false)]
         follow_links: bool,
     },
@@ -150,12 +155,14 @@ fn main() -> Result<()> {
             list,
             db,
             partial_bytes,
+            commit_every,
             clear_existing,
         } => index_sensitive(
             &normalize_arg_path(&root)?,
             &normalize_arg_path(&list)?,
             &normalize_arg_path(&db)?,
             partial_bytes,
+            commit_every,
             clear_existing,
         ),
         Command::ScanDest {
@@ -164,6 +171,7 @@ fn main() -> Result<()> {
             report,
             csv,
             use_cache,
+            commit_every,
             follow_links,
         } => {
             let csv = csv.map(|path| normalize_arg_path(&path)).transpose()?;
@@ -173,6 +181,7 @@ fn main() -> Result<()> {
                 &normalize_arg_path(&report)?,
                 csv.as_deref(),
                 use_cache,
+                commit_every,
                 follow_links,
             )
         }
@@ -188,10 +197,14 @@ fn index_sensitive(
     list: &Path,
     db: &Path,
     partial_bytes: u64,
+    commit_every: u64,
     clear_existing: bool,
 ) -> Result<()> {
     if partial_bytes == 0 {
         bail!("--partial-bytes must be greater than zero");
+    }
+    if commit_every == 0 {
+        bail!("--commit-every must be greater than zero");
     }
 
     fs::create_dir_all(db.parent().unwrap_or_else(|| Path::new(".")))
@@ -208,7 +221,8 @@ fn index_sensitive(
     let started = Instant::now();
     let input = File::open(list).with_context(|| format!("opening {}", list.display()))?;
     let reader = BufReader::new(input);
-    let tx = conn.transaction()?;
+    let mut tx = conn.transaction()?;
+    let mut pending_writes = 0_u64;
     let mut metrics = IndexMetrics::default();
 
     for line in reader.lines() {
@@ -256,8 +270,14 @@ fn index_sensitive(
                         now_string()
                     ],
                 )?;
+                pending_writes += 1;
                 metrics.files_indexed += 1;
                 metrics.bytes_hashed += fingerprint.bytes_read;
+                if pending_writes >= commit_every {
+                    tx.commit()?;
+                    tx = conn.transaction()?;
+                    pending_writes = 0;
+                }
             }
             Err(_) => {
                 metrics.read_errors += 1;
@@ -277,8 +297,13 @@ fn scan_dest(
     report: &Path,
     csv: Option<&Path>,
     use_cache: bool,
+    commit_every: u64,
     follow_links: bool,
 ) -> Result<()> {
+    if commit_every == 0 {
+        bail!("--commit-every must be greater than zero");
+    }
+
     fs::create_dir_all(report.parent().unwrap_or_else(|| Path::new(".")))
         .with_context(|| format!("creating report parent for {}", report.display()))?;
     if let Some(csv) = csv {
@@ -308,7 +333,8 @@ fn scan_dest(
         writeln!(writer, "dest_path,source_path,size,hash_algorithm,full_hash")?;
     }
 
-    let tx = conn.transaction()?;
+    let mut tx = conn.transaction()?;
+    let mut pending_writes = 0_u64;
     let mut metrics = ScanMetrics::default();
     let mut walker = WalkBuilder::new(root);
     walker.hidden(false).git_ignore(false).git_exclude(false).follow_links(follow_links);
@@ -343,7 +369,13 @@ fn scan_dest(
         let dest_rel = normalize_rel(path, root)?;
         metrics.files_seen += 1;
         upsert_dest_metadata(&tx, &root_key, run_id, &dest_rel, size, mtime_ns)?;
+        pending_writes += 1;
         metrics.metadata_cached += 1;
+        if pending_writes >= commit_every {
+            tx.commit()?;
+            tx = conn.transaction()?;
+            pending_writes = 0;
+        }
 
         if !index.sizes.contains(&size) {
             metrics.files_skipped_size += 1;
@@ -379,11 +411,18 @@ fn scan_dest(
             let key = (size, partial.partial_hash.clone());
             if !index.by_partial.contains_key(&key) {
                 upsert_cache(&tx, &root_key, &dest_rel, index.partial_bytes, &partial)?;
+                pending_writes += 1;
+                if pending_writes >= commit_every {
+                    tx.commit()?;
+                    tx = conn.transaction()?;
+                    pending_writes = 0;
+                }
                 continue;
             }
 
             if partial.full_hash.is_some() {
                 upsert_cache(&tx, &root_key, &dest_rel, index.partial_bytes, &partial)?;
+                pending_writes += 1;
                 partial
             } else {
                 let full = match hash_file(path, size, index.partial_bytes, true) {
@@ -396,6 +435,7 @@ fn scan_dest(
                 metrics.full_hashed += 1;
                 metrics.bytes_hashed += full.bytes_read;
                 upsert_cache(&tx, &root_key, &dest_rel, index.partial_bytes, &full)?;
+                pending_writes += 1;
                 full
             }
         };
@@ -420,6 +460,7 @@ fn scan_dest(
             metrics.full_hashed += 1;
             metrics.bytes_hashed += full.bytes_read;
             upsert_cache(&tx, &root_key, &dest_rel, index.partial_bytes, &full)?;
+            pending_writes += 1;
             fingerprint = full;
         }
 
@@ -461,8 +502,15 @@ fn scan_dest(
                         now_string()
                     ],
                 )?;
+                pending_writes += 1;
                 metrics.matches_found += 1;
             }
+        }
+
+        if pending_writes >= commit_every {
+            tx.commit()?;
+            tx = conn.transaction()?;
+            pending_writes = 0;
         }
     }
 
@@ -518,12 +566,12 @@ fn prune_dest(db: &Path, root: &Path) -> Result<()> {
     let root = root_key(root);
     let Some(latest_run_id) = conn
         .query_row(
-            "SELECT MAX(id) FROM scan_runs WHERE root = ?1",
+            "SELECT MAX(id) FROM scan_runs WHERE root = ?1 AND finished_at IS NOT NULL",
             params![root],
             |row| row.get::<_, Option<i64>>(0),
         )?
     else {
-        bail!("no scan runs found for root");
+        bail!("no finished scan runs found for root");
     };
 
     let stale_metadata = conn.execute(
