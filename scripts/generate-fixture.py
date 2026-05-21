@@ -184,6 +184,16 @@ def main():
         except OSError:
             pass
 
+    directory_expected_leaks = [
+        item for item in expected_leaks
+        if item[2].startswith("edge-")
+    ]
+    absolute_expected_leaks = [
+        item for item in directory_expected_leaks
+        if item[0].startswith("sensitive-edge/")
+        or item[0] == "sensitive-min-size/above-threshold.txt"
+    ]
+
     if sensitive_paths and not expected_leaks:
         source_rel = sensitive_paths[0]
         source_path = source_root / source_rel
@@ -195,10 +205,53 @@ def main():
     sensitive_manifest = manifest_root / "sensitive-paths.txt"
     sensitive_manifest.write_text("\n".join(sensitive_paths) + "\n", encoding="utf-8")
 
+    directory_manifest = manifest_root / "sensitive-directory-paths.txt"
+    directory_manifest.write_text(
+        "\n".join([
+            "sensitive-edge",
+            "sensitive-edge/small-exact-leak.txt",
+            "sensitive-min-size",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    absolute_manifest = manifest_root / "sensitive-absolute-paths.txt"
+    absolute_manifest.write_text(
+        "\n".join([
+            str(source_root / "sensitive-edge"),
+            str(source_root / "sensitive-min-size" / "above-threshold.txt"),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    invalid_absolute_manifest = manifest_root / "invalid-absolute-with-root.txt"
+    invalid_absolute_manifest.write_text(
+        str(source_root / "sensitive-edge" / "small-exact-leak.txt") + "\n",
+        encoding="utf-8",
+    )
+
+    invalid_relative_manifest = manifest_root / "invalid-relative-without-root.txt"
+    invalid_relative_manifest.write_text(
+        "sensitive-edge/small-exact-leak.txt\n",
+        encoding="utf-8",
+    )
+
     leaks_manifest = manifest_root / "expected-leaks.tsv"
     with leaks_manifest.open("w", encoding="utf-8") as fh:
         fh.write("source_rel\tdest_rel\treason\n")
         for source_rel, dest_rel, reason in expected_leaks:
+            fh.write(f"{source_rel}\t{dest_rel}\t{reason}\n")
+
+    directory_leaks_manifest = manifest_root / "expected-directory-leaks.tsv"
+    with directory_leaks_manifest.open("w", encoding="utf-8") as fh:
+        fh.write("source_rel\tdest_rel\treason\n")
+        for source_rel, dest_rel, reason in directory_expected_leaks:
+            fh.write(f"{source_rel}\t{dest_rel}\t{reason}\n")
+
+    absolute_leaks_manifest = manifest_root / "expected-absolute-leaks.tsv"
+    with absolute_leaks_manifest.open("w", encoding="utf-8") as fh:
+        fh.write("source_rel\tdest_rel\treason\n")
+        for source_rel, dest_rel, reason in absolute_expected_leaks:
             fh.write(f"{source_rel}\t{dest_rel}\t{reason}\n")
 
     symlink_leaks_manifest = manifest_root / "expected-symlink-leaks.tsv"
@@ -218,6 +271,14 @@ def main():
         "dest_root": str(dest_root),
         "sensitive_manifest": str(sensitive_manifest),
         "expected_leaks_manifest": str(leaks_manifest),
+        "directory_manifest": str(directory_manifest),
+        "absolute_manifest": str(absolute_manifest),
+        "invalid_absolute_manifest": str(invalid_absolute_manifest),
+        "invalid_relative_manifest": str(invalid_relative_manifest),
+        "expected_directory_leaks": len(directory_expected_leaks),
+        "expected_directory_leaks_manifest": str(directory_leaks_manifest),
+        "expected_absolute_leaks": len(absolute_expected_leaks),
+        "expected_absolute_leaks_manifest": str(absolute_leaks_manifest),
         "expected_symlink_leaks": len(expected_symlink_leaks),
         "expected_symlink_leaks_manifest": str(symlink_leaks_manifest),
     }
