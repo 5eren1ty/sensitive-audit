@@ -5,7 +5,7 @@
 It is intended for Linux environments where:
 
 - the source tree contains files that must not appear in a copy
-- you have a list of sensitive source paths
+- you have a list of sensitive source files or directories
 - destination paths may differ from source paths
 - the copy process itself is outside your control
 - performance matters on very large trees
@@ -39,12 +39,12 @@ Prebuilt binaries are attached to GitHub Releases:
 
 ```bash
 curl -L -o sensitive-audit.tar.gz \
-  https://github.com/5eren1ty/sensitive-audit/releases/download/v0.2.0/sensitive-audit-v0.2.0-x86_64-rhel8.tar.gz
+  https://github.com/5eren1ty/sensitive-audit/releases/download/v0.2.1/sensitive-audit-v0.2.1-x86_64-rhel8.tar.gz
 tar -xzf sensitive-audit.tar.gz
-sudo install -m 0755 sensitive-audit-v0.2.0-x86_64-rhel8/sensitive-audit /usr/local/bin/sensitive-audit
+sudo install -m 0755 sensitive-audit-v0.2.1-x86_64-rhel8/sensitive-audit /usr/local/bin/sensitive-audit
 ```
 
-Replace `v0.2.0` with the release tag you want to install.
+Replace `v0.2.1` with the release tag you want to install.
 
 Release binaries are built inside a UBI8 container for RHEL8-compatible Linux userspace. You can also build from source:
 
@@ -84,7 +84,7 @@ Without `--root`, entries must be absolute paths:
 /mnt/source/users/alice/private.key
 ```
 
-Directory entries are expanded recursively during indexing. Source symlinks are skipped.
+Directory entries are expanded recursively during indexing. Files discovered more than once through overlapping entries are indexed once. Source symlinks are skipped.
 
 ## Basic Usage
 
@@ -211,6 +211,7 @@ The fixture generator creates normal copied files plus deterministic edge cases:
 - large sensitive file copied under a different destination path
 - same-size destination file with different content
 - large destination file with the same first 64 KiB as a sensitive file but a different tail
+- mixed file/directory manifests, overlapping manifest entries, missing paths, non-file entries, symlinks, and invalid path-mode cases
 
 The comparison step verifies that only expected sensitive leaks are reported.
 
