@@ -192,6 +192,20 @@ struct WorkerFingerprint {
     bytes_hashed: u64,
 }
 
+#[derive(Debug, Default)]
+struct ManifestExpansion {
+    source_keys: HashSet<String>,
+    manifest_entries: u64,
+    manifest_file_entries: u64,
+    manifest_directory_entries: u64,
+    files_discovered: u64,
+    directories_walked: u64,
+    duplicate_files_skipped: u64,
+    missing_paths: u64,
+    skipped_non_files: u64,
+    read_errors: u64,
+}
+
 #[derive(Debug)]
 struct SensitiveIndex {
     sizes: HashSet<u64>,
@@ -1077,34 +1091,115 @@ fn destination_summary(conn: &Connection, root: &Path) -> Result<serde_json::Val
 }
 
 fn manifest_summary(conn: &Connection, list: &Path) -> Result<serde_json::Value> {
-    let listed = read_sensitive_list(list)?;
+    let mode = db_source_path_mode(conn)?;
+    let root = match mode {
+        SourcePathMode::RootRelative => Some(
+            get_meta(conn, "source_root")?
+                .map(PathBuf::from)
+                .context("database is missing source_root metadata; rerun index-sensitive with this version")?,
+        ),
+        SourcePathMode::Absolute => None,
+    };
+    let expansion = expand_manifest_list(list, root.as_deref(), mode)?;
     let indexed = load_indexed_source_paths(conn)?;
-    let listed_count = listed.len();
-    let already_indexed = listed.intersection(&indexed).count();
-    let missing_from_index = listed.difference(&indexed).count();
-    let extra_indexed_not_in_list = indexed.difference(&listed).count();
+    let already_indexed = expansion.source_keys.intersection(&indexed).count();
+    let missing_from_index = expansion.source_keys.difference(&indexed).count();
+    let extra_indexed_not_in_list = indexed.difference(&expansion.source_keys).count();
 
     Ok(serde_json::json!({
         "list": list.display().to_string(),
-        "listed_paths": listed_count,
+        "source_path_mode": mode.as_str(),
+        "manifest_entries": expansion.manifest_entries,
+        "manifest_file_entries": expansion.manifest_file_entries,
+        "manifest_directory_entries": expansion.manifest_directory_entries,
+        "files_discovered": expansion.files_discovered,
+        "directories_walked": expansion.directories_walked,
+        "duplicate_files_skipped": expansion.duplicate_files_skipped,
+        "missing_paths": expansion.missing_paths,
+        "skipped_non_files": expansion.skipped_non_files,
+        "read_errors": expansion.read_errors,
         "already_indexed": already_indexed,
         "missing_from_index": missing_from_index,
         "extra_indexed_not_in_list": extra_indexed_not_in_list,
     }))
 }
 
-fn read_sensitive_list(list: &Path) -> Result<HashSet<String>> {
+fn expand_manifest_list(
+    list: &Path,
+    root: Option<&Path>,
+    mode: SourcePathMode,
+) -> Result<ManifestExpansion> {
     let input = File::open(list).with_context(|| format!("opening {}", list.display()))?;
     let reader = BufReader::new(input);
-    let mut paths = HashSet::new();
+    let mut expansion = ManifestExpansion::default();
     for line in reader.lines() {
         let line = line.with_context(|| format!("reading {}", list.display()))?;
         let item = line.trim();
-        if !item.is_empty() && !item.starts_with('#') {
-            paths.insert(item.to_string());
+        if item.is_empty() || item.starts_with('#') {
+            continue;
+        }
+
+        expansion.manifest_entries += 1;
+        let path = resolve_manifest_entry(root, mode, item)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                expansion.missing_paths += 1;
+                continue;
+            }
+        };
+        if metadata.is_file() {
+            expansion.manifest_file_entries += 1;
+            add_manifest_expansion_file(&path, root, mode, &mut expansion)?;
+        } else if metadata.is_dir() {
+            expansion.manifest_directory_entries += 1;
+            let mut walker = WalkBuilder::new(&path);
+            walker
+                .hidden(false)
+                .git_ignore(false)
+                .git_exclude(false)
+                .follow_links(false);
+            for entry in walker.build() {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        expansion.read_errors += 1;
+                        continue;
+                    }
+                };
+                let Some(file_type) = entry.file_type() else {
+                    expansion.skipped_non_files += 1;
+                    continue;
+                };
+                if file_type.is_dir() {
+                    expansion.directories_walked += 1;
+                    continue;
+                }
+                if file_type.is_file() {
+                    add_manifest_expansion_file(entry.path(), root, mode, &mut expansion)?;
+                } else {
+                    expansion.skipped_non_files += 1;
+                }
+            }
+        } else {
+            expansion.skipped_non_files += 1;
         }
     }
-    Ok(paths)
+    Ok(expansion)
+}
+
+fn add_manifest_expansion_file(
+    path: &Path,
+    root: Option<&Path>,
+    mode: SourcePathMode,
+    expansion: &mut ManifestExpansion,
+) -> Result<()> {
+    let source_key = source_key_for_path(path, root, mode)?;
+    expansion.files_discovered += 1;
+    if !expansion.source_keys.insert(source_key) {
+        expansion.duplicate_files_skipped += 1;
+    }
+    Ok(())
 }
 
 fn load_indexed_source_paths(conn: &Connection) -> Result<HashSet<String>> {
