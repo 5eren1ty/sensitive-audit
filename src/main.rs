@@ -29,10 +29,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Index sensitive source files listed as paths relative to --root.
+    /// Index sensitive source files listed as files/directories.
     IndexSensitive {
         #[arg(long)]
-        root: PathBuf,
+        root: Option<PathBuf>,
         #[arg(long)]
         list: PathBuf,
         #[arg(long)]
@@ -95,7 +95,7 @@ enum Command {
 
 #[derive(Debug, Clone)]
 struct SensitiveRecord {
-    source_rel: String,
+    source_key: String,
     size: u64,
     partial_hash: String,
     full_hash: String,
@@ -103,14 +103,19 @@ struct SensitiveRecord {
 
 #[derive(Debug, Clone)]
 struct CandidateRecord {
-    source_rel: String,
+    source_key: String,
     full_hash: String,
 }
 
 #[derive(Debug, Default, Serialize)]
 struct IndexMetrics {
-    sensitive_paths_seen: u64,
+    manifest_entries_seen: u64,
+    manifest_file_entries: u64,
+    manifest_directory_entries: u64,
+    files_discovered: u64,
+    directories_walked: u64,
     files_indexed: u64,
+    duplicate_files_skipped: u64,
     missing_paths: u64,
     skipped_non_files: u64,
     files_skipped_min_size: u64,
@@ -192,7 +197,31 @@ struct SensitiveIndex {
     sizes: HashSet<u64>,
     by_partial: HashMap<(u64, String), Vec<CandidateRecord>>,
     partial_bytes: u64,
-    source_root: PathBuf,
+    source_root: Option<PathBuf>,
+    source_path_mode: SourcePathMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourcePathMode {
+    RootRelative,
+    Absolute,
+}
+
+impl SourcePathMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            SourcePathMode::RootRelative => "root_relative",
+            SourcePathMode::Absolute => "absolute",
+        }
+    }
+
+    fn from_meta(value: Option<String>) -> Result<Self> {
+        match value.as_deref() {
+            Some("root_relative") | None => Ok(SourcePathMode::RootRelative),
+            Some("absolute") => Ok(SourcePathMode::Absolute),
+            Some(other) => bail!("unsupported source_path_mode metadata value: {other}"),
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -208,17 +237,20 @@ fn main() -> Result<()> {
             progress_every_seconds,
             progress_every_files,
             clear_existing,
-        } => index_sensitive(
-            &normalize_arg_path(&root)?,
-            &normalize_arg_path(&list)?,
-            &normalize_arg_path(&db)?,
-            partial_bytes,
-            min_size_bytes,
-            commit_every,
-            progress_every_seconds,
-            progress_every_files,
-            clear_existing,
-        ),
+        } => {
+            let root = root.map(|path| normalize_arg_path(&path)).transpose()?;
+            index_sensitive(
+                root.as_deref(),
+                &normalize_arg_path(&list)?,
+                &normalize_arg_path(&db)?,
+                partial_bytes,
+                min_size_bytes,
+                commit_every,
+                progress_every_seconds,
+                progress_every_files,
+                clear_existing,
+            )
+        }
         Command::ScanDest {
             root,
             db,
@@ -259,7 +291,7 @@ fn main() -> Result<()> {
 }
 
 fn index_sensitive(
-    root: &Path,
+    root: Option<&Path>,
     list: &Path,
     db: &Path,
     partial_bytes: u64,
@@ -275,16 +307,27 @@ fn index_sensitive(
     if commit_every == 0 {
         bail!("--commit-every must be greater than zero");
     }
+    let source_path_mode = if root.is_some() {
+        SourcePathMode::RootRelative
+    } else {
+        SourcePathMode::Absolute
+    };
 
     fs::create_dir_all(db.parent().unwrap_or_else(|| Path::new(".")))
         .with_context(|| format!("creating database parent for {}", db.display()))?;
     let mut conn = open_db(db)?;
     init_schema(&conn)?;
-    set_meta(&conn, "partial_bytes", &partial_bytes.to_string())?;
-    set_meta(&conn, "source_root", &root.display().to_string())?;
+    validate_index_mode(&conn, root, source_path_mode, clear_existing)?;
 
     if clear_existing {
         conn.execute("DELETE FROM sensitive_files", [])?;
+    }
+    set_meta(&conn, "partial_bytes", &partial_bytes.to_string())?;
+    set_meta(&conn, "source_path_mode", source_path_mode.as_str())?;
+    if let Some(root) = root {
+        set_meta(&conn, "source_root", &root.display().to_string())?;
+    } else {
+        conn.execute("DELETE FROM meta WHERE key = 'source_root'", [])?;
     }
 
     let started = Instant::now();
@@ -294,32 +337,18 @@ fn index_sensitive(
     let mut tx = conn.transaction()?;
     let mut pending_writes = 0_u64;
     let mut metrics = IndexMetrics::default();
+    let mut discovered = HashSet::new();
 
     for line in reader.lines() {
-        let source_rel = line.with_context(|| format!("reading {}", list.display()))?;
-        let source_rel = source_rel.trim();
-        if source_rel.is_empty() || source_rel.starts_with('#') {
+        let entry = line.with_context(|| format!("reading {}", list.display()))?;
+        let entry = entry.trim();
+        if entry.is_empty() || entry.starts_with('#') {
             continue;
         }
 
-        metrics.sensitive_paths_seen += 1;
-        if should_report_progress(
-            &mut last_progress,
-            progress_every_seconds,
-            progress_every_files,
-            metrics.sensitive_paths_seen,
-        ) {
-            eprintln!(
-                "index progress: paths_seen={} files_indexed={} files_per_second={:.2} bytes_hashed={} elapsed_s={:.1}",
-                metrics.sensitive_paths_seen,
-                metrics.files_indexed,
-                rate(metrics.sensitive_paths_seen, started),
-                metrics.bytes_hashed,
-                elapsed_seconds(started)
-            );
-        }
-        let path = root.join(source_rel);
-        let metadata = match fs::metadata(&path) {
+        metrics.manifest_entries_seen += 1;
+        let path = resolve_manifest_entry(root, source_path_mode, entry)?;
+        let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(_) => {
                 metrics.missing_paths += 1;
@@ -328,59 +357,249 @@ fn index_sensitive(
             }
         };
 
-        if !metadata.is_file() {
-            metrics.skipped_non_files += 1;
-            continue;
-        }
-
-        let size = metadata.len();
-        if size < min_size_bytes {
-            metrics.files_skipped_min_size += 1;
-            continue;
-        }
-        match hash_file(&path, size, partial_bytes, true) {
-            Ok(fingerprint) => {
-                let full_hash = fingerprint
-                    .full_hash
-                    .as_deref()
-                    .expect("full hash requested");
-                tx.execute(
-                    "INSERT INTO sensitive_files (source_rel, size, partial_hash, full_hash, indexed_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(source_rel) DO UPDATE SET
-                        size = excluded.size,
-                        partial_hash = excluded.partial_hash,
-                        full_hash = excluded.full_hash,
-                        indexed_at = excluded.indexed_at",
-                    params![
-                        source_rel,
-                        size_to_i64(size)?,
-                        fingerprint.partial_hash,
-                        full_hash,
-                        now_string()
-                    ],
+        if metadata.is_file() {
+            metrics.manifest_file_entries += 1;
+            index_discovered_file(
+                &path,
+                root,
+                source_path_mode,
+                metadata.len(),
+                partial_bytes,
+                min_size_bytes,
+                &mut discovered,
+                &mut tx,
+                &mut pending_writes,
+                &mut metrics,
+                started,
+                &mut last_progress,
+                progress_every_seconds,
+                progress_every_files,
+            )?;
+            if pending_writes >= commit_every {
+                tx.commit()?;
+                tx = conn.transaction()?;
+                pending_writes = 0;
+            }
+        } else if metadata.is_dir() {
+            metrics.manifest_directory_entries += 1;
+            let mut walker = WalkBuilder::new(&path);
+            walker
+                .hidden(false)
+                .git_ignore(false)
+                .git_exclude(false)
+                .follow_links(false);
+            for entry in walker.build() {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        metrics.read_errors += 1;
+                        continue;
+                    }
+                };
+                let Some(file_type) = entry.file_type() else {
+                    metrics.skipped_non_files += 1;
+                    continue;
+                };
+                if file_type.is_dir() {
+                    metrics.directories_walked += 1;
+                    continue;
+                }
+                if !file_type.is_file() {
+                    metrics.skipped_non_files += 1;
+                    continue;
+                }
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(_) => {
+                        metrics.read_errors += 1;
+                        eprintln!(
+                            "skipping file with unreadable metadata: {}",
+                            entry.path().display()
+                        );
+                        continue;
+                    }
+                };
+                index_discovered_file(
+                    entry.path(),
+                    root,
+                    source_path_mode,
+                    metadata.len(),
+                    partial_bytes,
+                    min_size_bytes,
+                    &mut discovered,
+                    &mut tx,
+                    &mut pending_writes,
+                    &mut metrics,
+                    started,
+                    &mut last_progress,
+                    progress_every_seconds,
+                    progress_every_files,
                 )?;
-                pending_writes += 1;
-                metrics.files_indexed += 1;
-                metrics.bytes_hashed += fingerprint.bytes_read;
                 if pending_writes >= commit_every {
                     tx.commit()?;
                     tx = conn.transaction()?;
                     pending_writes = 0;
                 }
             }
-            Err(_) => {
-                metrics.read_errors += 1;
-                eprintln!("skipping unreadable source file: {}", path.display());
-            }
+        } else {
+            metrics.skipped_non_files += 1;
         }
     }
 
     tx.commit()?;
     metrics.elapsed_ms = started.elapsed().as_millis();
-    metrics.files_per_second = rate(metrics.sensitive_paths_seen, started);
+    metrics.files_per_second = rate(metrics.files_discovered, started);
     println!("{}", serde_json::to_string_pretty(&metrics)?);
     Ok(())
+}
+
+fn validate_index_mode(
+    conn: &Connection,
+    root: Option<&Path>,
+    requested_mode: SourcePathMode,
+    clear_existing: bool,
+) -> Result<()> {
+    let existing_files: i64 =
+        conn.query_row("SELECT COUNT(*) FROM sensitive_files", [], |row| row.get(0))?;
+    if clear_existing || existing_files == 0 {
+        return Ok(());
+    }
+
+    let existing_mode = db_source_path_mode(conn)?;
+    if existing_mode != requested_mode {
+        bail!(
+            "database source path mode is {}, but this index run uses {}; rerun without --no-clear-existing or use a matching manifest mode",
+            existing_mode.as_str(),
+            requested_mode.as_str()
+        );
+    }
+
+    if requested_mode == SourcePathMode::RootRelative {
+        let existing_root = get_meta(conn, "source_root")?;
+        let requested_root = root
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        if existing_root.as_deref() != Some(requested_root.as_str()) {
+            bail!(
+                "database source root does not match this index run; rerun without --no-clear-existing or use the original --root"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_manifest_entry(
+    root: Option<&Path>,
+    mode: SourcePathMode,
+    entry: &str,
+) -> Result<PathBuf> {
+    let raw = Path::new(entry);
+    match mode {
+        SourcePathMode::RootRelative => {
+            if raw.is_absolute() || starts_with_tilde(entry) {
+                bail!("manifest entry '{entry}' is absolute, but --root requires relative entries");
+            }
+            let root = root.context("--root is required for root-relative manifests")?;
+            Ok(root.join(raw))
+        }
+        SourcePathMode::Absolute => {
+            let path = expand_tilde(raw)?;
+            if !path.is_absolute() {
+                bail!("manifest entry '{entry}' is relative, but omitting --root requires absolute entries");
+            }
+            Ok(path)
+        }
+    }
+}
+
+fn index_discovered_file(
+    path: &Path,
+    root: Option<&Path>,
+    mode: SourcePathMode,
+    size: u64,
+    partial_bytes: u64,
+    min_size_bytes: u64,
+    discovered: &mut HashSet<String>,
+    tx: &mut rusqlite::Transaction<'_>,
+    pending_writes: &mut u64,
+    metrics: &mut IndexMetrics,
+    started: Instant,
+    last_progress: &mut Instant,
+    progress_every_seconds: u64,
+    progress_every_files: u64,
+) -> Result<()> {
+    let source_key = source_key_for_path(path, root, mode)?;
+    metrics.files_discovered += 1;
+    if should_report_progress(
+        last_progress,
+        progress_every_seconds,
+        progress_every_files,
+        metrics.files_discovered,
+    ) {
+        eprintln!(
+            "index progress: files_discovered={} files_indexed={} files_per_second={:.2} bytes_hashed={} elapsed_s={:.1}",
+            metrics.files_discovered,
+            metrics.files_indexed,
+            rate(metrics.files_discovered, started),
+            metrics.bytes_hashed,
+            elapsed_seconds(started)
+        );
+    }
+
+    if !discovered.insert(source_key.clone()) {
+        metrics.duplicate_files_skipped += 1;
+        return Ok(());
+    }
+
+    if size < min_size_bytes {
+        metrics.files_skipped_min_size += 1;
+        return Ok(());
+    }
+
+    match hash_file(path, size, partial_bytes, true) {
+        Ok(fingerprint) => {
+            let full_hash = fingerprint
+                .full_hash
+                .as_deref()
+                .expect("full hash requested");
+            tx.execute(
+                "INSERT INTO sensitive_files (source_rel, size, partial_hash, full_hash, indexed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(source_rel) DO UPDATE SET
+                    size = excluded.size,
+                    partial_hash = excluded.partial_hash,
+                    full_hash = excluded.full_hash,
+                    indexed_at = excluded.indexed_at",
+                params![
+                    source_key,
+                    size_to_i64(size)?,
+                    fingerprint.partial_hash,
+                    full_hash,
+                    now_string()
+                ],
+            )?;
+            *pending_writes += 1;
+            metrics.files_indexed += 1;
+            metrics.bytes_hashed += fingerprint.bytes_read;
+        }
+        Err(_) => {
+            metrics.read_errors += 1;
+            eprintln!("skipping unreadable source file: {}", path.display());
+        }
+    }
+
+    Ok(())
+}
+
+fn source_key_for_path(rooted_path: &Path, root: Option<&Path>, mode: SourcePathMode) -> Result<String> {
+    match mode {
+        SourcePathMode::RootRelative => {
+            let root = root.context("--root is required for root-relative source paths")?;
+            normalize_rel(rooted_path, root)
+        }
+        SourcePathMode::Absolute => Ok(path_key(rooted_path)),
+    }
 }
 
 fn scan_dest(
@@ -635,7 +854,7 @@ fn scan_dest(
         for candidate in candidates {
             if candidate.full_hash == full_hash {
                 let dest_path = root.join(&dest_rel).display().to_string();
-                let source_path = index.source_root.join(&candidate.source_rel).display().to_string();
+                let source_path = source_display_path(&index, &candidate.source_key)?;
                 let item = MatchReport {
                     dest_path,
                     source_path,
@@ -660,7 +879,7 @@ fn scan_dest(
                     params![
                         run_id,
                         &dest_rel,
-                        &candidate.source_rel,
+                        &candidate.source_key,
                         size_to_i64(item.size)?,
                         &item.full_hash,
                         now_string()
@@ -728,11 +947,13 @@ fn db_summary(db: &Path, root: Option<&Path>, list: Option<&Path>) -> Result<()>
     let conn = open_db(db)?;
     init_schema(&conn)?;
     let partial_bytes = get_meta(&conn, "partial_bytes")?.unwrap_or_else(|| "unknown".to_string());
+    let source_path_mode = db_source_path_mode(&conn)?.as_str();
     let source_root = get_meta(&conn, "source_root")?.unwrap_or_else(|| "unknown".to_string());
 
     let mut summary = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
         "partial_bytes": partial_bytes,
+        "source_path_mode": source_path_mode,
         "source_root": source_root,
         "index": index_summary(&conn)?,
         "scan_runs": scan_runs_summary(&conn)?,
@@ -894,6 +1115,10 @@ fn load_indexed_source_paths(conn: &Connection) -> Result<HashSet<String>> {
         paths.insert(row?);
     }
     Ok(paths)
+}
+
+fn db_source_path_mode(conn: &Connection) -> Result<SourcePathMode> {
+    SourcePathMode::from_meta(get_meta(conn, "source_path_mode")?)
 }
 
 fn latest_run_id(conn: &Connection, root: Option<&str>, finished: bool) -> Result<Option<i64>> {
@@ -1118,7 +1343,7 @@ fn apply_completed_fingerprint(
     for candidate in candidates {
         if candidate.full_hash == full_hash {
             let dest_path = root.join(&outcome.dest_rel).display().to_string();
-            let source_path = index.source_root.join(&candidate.source_rel).display().to_string();
+            let source_path = source_display_path(index, &candidate.source_key)?;
             let item = MatchReport {
                 dest_path,
                 source_path,
@@ -1143,7 +1368,7 @@ fn apply_completed_fingerprint(
                 params![
                     run_id,
                     &outcome.dest_rel,
-                    &candidate.source_rel,
+                    &candidate.source_key,
                     size_to_i64(item.size)?,
                     &item.full_hash,
                     now_string()
@@ -1306,9 +1531,15 @@ fn load_sensitive_index(conn: &Connection) -> Result<SensitiveIndex> {
     let partial_bytes = get_meta(conn, "partial_bytes")?
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(DEFAULT_PARTIAL_BYTES);
-    let source_root = get_meta(conn, "source_root")?
-        .map(PathBuf::from)
-        .context("database is missing source_root metadata; rerun index-sensitive with this version")?;
+    let source_path_mode = db_source_path_mode(conn)?;
+    let source_root = match source_path_mode {
+        SourcePathMode::RootRelative => Some(
+            get_meta(conn, "source_root")?
+                .map(PathBuf::from)
+                .context("database is missing source_root metadata; rerun index-sensitive with this version")?,
+        ),
+        SourcePathMode::Absolute => None,
+    };
     let mut stmt = conn.prepare(
         "SELECT source_rel, size, partial_hash, full_hash
          FROM sensitive_files
@@ -1316,7 +1547,7 @@ fn load_sensitive_index(conn: &Connection) -> Result<SensitiveIndex> {
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(SensitiveRecord {
-            source_rel: row.get(0)?,
+            source_key: row.get(0)?,
             size: i64_to_u64(row.get::<_, i64>(1)?)?,
             partial_hash: row.get(2)?,
             full_hash: row.get(3)?,
@@ -1332,7 +1563,7 @@ fn load_sensitive_index(conn: &Connection) -> Result<SensitiveIndex> {
             .entry((record.size, record.partial_hash))
             .or_default()
             .push(CandidateRecord {
-                source_rel: record.source_rel,
+                source_key: record.source_key,
                 full_hash: record.full_hash,
             });
     }
@@ -1342,6 +1573,7 @@ fn load_sensitive_index(conn: &Connection) -> Result<SensitiveIndex> {
         by_partial,
         partial_bytes,
         source_root,
+        source_path_mode,
     })
 }
 
@@ -1528,6 +1760,19 @@ fn normalize_rel(path: &Path, root: &Path) -> Result<String> {
     Ok(rel.to_string_lossy().replace('\\', "/"))
 }
 
+fn source_display_path(index: &SensitiveIndex, source_key: &str) -> Result<String> {
+    match index.source_path_mode {
+        SourcePathMode::RootRelative => {
+            let root = index
+                .source_root
+                .as_ref()
+                .context("root-relative index is missing source_root metadata")?;
+            Ok(root.join(source_key).display().to_string())
+        }
+        SourcePathMode::Absolute => Ok(source_key.to_string()),
+    }
+}
+
 fn normalize_arg_path(path: &Path) -> Result<PathBuf> {
     let expanded = expand_tilde(path)?;
     if expanded.is_absolute() {
@@ -1553,6 +1798,14 @@ fn expand_tilde(path: &Path) -> Result<PathBuf> {
         .or_else(|| env::var_os("USERPROFILE"))
         .context("path uses ~ but HOME/USERPROFILE is not set")?;
     Ok(PathBuf::from(home).join(rest))
+}
+
+fn starts_with_tilde(value: &str) -> bool {
+    value == "~" || value.starts_with("~/") || value.starts_with("~\\")
+}
+
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn should_report_progress(
