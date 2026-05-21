@@ -176,6 +176,11 @@ def main():
         write_pattern(symlink_source, b"symlink-sensitive-target" * 8)
         sensitive_files += 1
         sensitive_paths.append(rel(symlink_source, source_root))
+        source_symlink = edge_root / "source-link-to-small.txt"
+        try:
+            source_symlink.symlink_to(small_source)
+        except OSError:
+            pass
         symlink_dest = dest_root / "symlinked" / "sensitive-link.bin"
         symlink_dest.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -183,6 +188,8 @@ def main():
             expected_symlink_leaks.append((rel(symlink_source, source_root), rel(symlink_dest, dest_root), "edge-symlink-sensitive"))
         except OSError:
             pass
+
+        (source_root / "sensitive-empty-dir").mkdir(parents=True, exist_ok=True)
 
     directory_expected_leaks = [
         item for item in expected_leaks
@@ -193,6 +200,8 @@ def main():
         if item[0].startswith("sensitive-edge/")
         or item[0] == "sensitive-min-size/above-threshold.txt"
     ]
+    mixed_expected_leaks = directory_expected_leaks
+    absolute_mixed_expected_leaks = absolute_expected_leaks
 
     if sensitive_paths and not expected_leaks:
         source_rel = sensitive_paths[0]
@@ -215,11 +224,38 @@ def main():
         encoding="utf-8",
     )
 
+    mixed_manifest = manifest_root / "sensitive-mixed-paths.txt"
+    mixed_manifest.write_text(
+        "\n".join([
+            "# root-relative mixed manifest: directories, files, overlaps, empty dirs, symlinks",
+            "sensitive-edge",
+            "sensitive-edge",
+            "sensitive-edge/small-exact-leak.txt",
+            "sensitive-min-size/at-threshold.txt",
+            "sensitive-min-size",
+            "sensitive-empty-dir",
+            "sensitive-edge/source-link-to-small.txt",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
     absolute_manifest = manifest_root / "sensitive-absolute-paths.txt"
     absolute_manifest.write_text(
         "\n".join([
             str(source_root / "sensitive-edge"),
             str(source_root / "sensitive-min-size" / "above-threshold.txt"),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    absolute_mixed_manifest = manifest_root / "sensitive-absolute-mixed-paths.txt"
+    absolute_mixed_manifest.write_text(
+        "\n".join([
+            "# absolute mixed manifest: directories, files, overlaps, empty dirs",
+            str(source_root / "sensitive-edge"),
+            str(source_root / "sensitive-edge" / "large-exact-leak.bin"),
+            str(source_root / "sensitive-min-size" / "above-threshold.txt"),
+            str(source_root / "sensitive-empty-dir"),
         ]) + "\n",
         encoding="utf-8",
     )
@@ -233,6 +269,43 @@ def main():
     invalid_relative_manifest = manifest_root / "invalid-relative-without-root.txt"
     invalid_relative_manifest.write_text(
         "sensitive-edge/small-exact-leak.txt\n",
+        encoding="utf-8",
+    )
+
+    invalid_mixed_with_root_manifest = manifest_root / "invalid-mixed-with-root.txt"
+    invalid_mixed_with_root_manifest.write_text(
+        "\n".join([
+            "sensitive-edge/small-exact-leak.txt",
+            str(source_root / "sensitive-edge" / "large-exact-leak.bin"),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    invalid_mixed_without_root_manifest = manifest_root / "invalid-mixed-without-root.txt"
+    invalid_mixed_without_root_manifest.write_text(
+        "\n".join([
+            str(source_root / "sensitive-edge" / "small-exact-leak.txt"),
+            "sensitive-edge/large-exact-leak.bin",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    missing_relative_manifest = manifest_root / "missing-relative-paths.txt"
+    missing_relative_manifest.write_text(
+        "\n".join([
+            "sensitive-edge/small-exact-leak.txt",
+            "sensitive-edge/does-not-exist.bin",
+            "missing-directory",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    non_file_relative_manifest = manifest_root / "non-file-relative-paths.txt"
+    non_file_relative_manifest.write_text(
+        "\n".join([
+            "sensitive-empty-dir",
+            "sensitive-edge/source-link-to-small.txt",
+        ]) + "\n",
         encoding="utf-8",
     )
 
@@ -254,6 +327,18 @@ def main():
         for source_rel, dest_rel, reason in absolute_expected_leaks:
             fh.write(f"{source_rel}\t{dest_rel}\t{reason}\n")
 
+    mixed_leaks_manifest = manifest_root / "expected-mixed-leaks.tsv"
+    with mixed_leaks_manifest.open("w", encoding="utf-8") as fh:
+        fh.write("source_rel\tdest_rel\treason\n")
+        for source_rel, dest_rel, reason in mixed_expected_leaks:
+            fh.write(f"{source_rel}\t{dest_rel}\t{reason}\n")
+
+    absolute_mixed_leaks_manifest = manifest_root / "expected-absolute-mixed-leaks.tsv"
+    with absolute_mixed_leaks_manifest.open("w", encoding="utf-8") as fh:
+        fh.write("source_rel\tdest_rel\treason\n")
+        for source_rel, dest_rel, reason in absolute_mixed_expected_leaks:
+            fh.write(f"{source_rel}\t{dest_rel}\t{reason}\n")
+
     symlink_leaks_manifest = manifest_root / "expected-symlink-leaks.tsv"
     with symlink_leaks_manifest.open("w", encoding="utf-8") as fh:
         fh.write("source_rel\tdest_rel\treason\n")
@@ -272,13 +357,23 @@ def main():
         "sensitive_manifest": str(sensitive_manifest),
         "expected_leaks_manifest": str(leaks_manifest),
         "directory_manifest": str(directory_manifest),
+        "mixed_manifest": str(mixed_manifest),
         "absolute_manifest": str(absolute_manifest),
+        "absolute_mixed_manifest": str(absolute_mixed_manifest),
         "invalid_absolute_manifest": str(invalid_absolute_manifest),
         "invalid_relative_manifest": str(invalid_relative_manifest),
+        "invalid_mixed_with_root_manifest": str(invalid_mixed_with_root_manifest),
+        "invalid_mixed_without_root_manifest": str(invalid_mixed_without_root_manifest),
+        "missing_relative_manifest": str(missing_relative_manifest),
+        "non_file_relative_manifest": str(non_file_relative_manifest),
         "expected_directory_leaks": len(directory_expected_leaks),
         "expected_directory_leaks_manifest": str(directory_leaks_manifest),
         "expected_absolute_leaks": len(absolute_expected_leaks),
         "expected_absolute_leaks_manifest": str(absolute_leaks_manifest),
+        "expected_mixed_leaks": len(mixed_expected_leaks),
+        "expected_mixed_leaks_manifest": str(mixed_leaks_manifest),
+        "expected_absolute_mixed_leaks": len(absolute_mixed_expected_leaks),
+        "expected_absolute_mixed_leaks_manifest": str(absolute_mixed_leaks_manifest),
         "expected_symlink_leaks": len(expected_symlink_leaks),
         "expected_symlink_leaks_manifest": str(symlink_leaks_manifest),
     }
