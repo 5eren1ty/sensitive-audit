@@ -64,17 +64,27 @@ target/release/sensitive-audit
 
 Copy that binary to the target host if you build elsewhere.
 
-## Sensitive Path List
+## Sensitive Manifest
 
-Create a UTF-8 text file containing paths relative to the sensitive source root:
+Create a UTF-8 text file containing sensitive files or directories. Blank lines and lines starting with `#` are ignored.
+
+With `--root`, entries must be relative to the sensitive source root:
 
 ```text
 finance/payroll/export.csv
+finance/archive
 users/alice/private.key
-archive/client-a/secrets.tar
 ```
 
-Blank lines and lines starting with `#` are ignored.
+Without `--root`, entries must be absolute paths:
+
+```text
+/mnt/source/finance/payroll/export.csv
+/mnt/source/finance/archive
+/mnt/source/users/alice/private.key
+```
+
+Directory entries are expanded recursively during indexing. Source symlinks are skipped.
 
 ## Basic Usage
 
@@ -86,6 +96,14 @@ sensitive-audit index-sensitive \
   --list sensitive-paths.txt \
   --db /var/tmp/sensitive-audit/audit.db \
   --min-size-bytes 0
+```
+
+Or index an absolute-path manifest without `--root`:
+
+```bash
+sensitive-audit index-sensitive \
+  --list sensitive-absolute-paths.txt \
+  --db /var/tmp/sensitive-audit/audit.db
 ```
 
 Scan the destination:
